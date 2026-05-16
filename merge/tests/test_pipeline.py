@@ -14,6 +14,38 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# svd_factor isolation — math gate
+# ---------------------------------------------------------------------------
+
+def test_svd_factor_round_trip_within_truncation_tolerance() -> None:
+    """svd_factor + load's reconstruction recovers a rank-r matrix exactly.
+
+    Diagnostic gate isolating the SVD factorization math from the rest of
+    the pipeline. Input is built to be exactly rank-r so SVD truncation is
+    a no-op and any error reveals a scaling/broadcasting bug in
+    ``svd_factor``.
+    """
+    torch = pytest.importorskip("torch")
+    from merge.pipeline import svd_factor
+
+    r, alpha = 32, 64
+    out_dim, in_dim = 64, 64
+
+    torch.manual_seed(0)
+    U_true = torch.linalg.qr(torch.randn(out_dim, r))[0]                    # [out, r], orthonormal
+    S_true = torch.tensor([1.0 + i * 0.1 for i in range(r)])                # known spectrum
+    Vh_true = torch.linalg.qr(torch.randn(in_dim, r))[0].T                  # [r, in], orthonormal
+    delta_w = U_true @ torch.diag(S_true) @ Vh_true                         # rank-r exactly, fp32
+
+    lora_A, lora_B = svd_factor(delta_w, r=r, alpha=alpha)
+    reconstructed = (alpha / r) * lora_B.float() @ lora_A.float()
+
+    # Rank-r input means SVD truncation is lossless. Any error here is a
+    # scaling or broadcasting bug, not truncation.
+    torch.testing.assert_close(reconstructed, delta_w, rtol=1e-4, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # Happy paths — one per method
 # ---------------------------------------------------------------------------
 
