@@ -102,10 +102,10 @@ Update this table as stages land. Single source of truth.
 |---|---|---|---|
 | `verify_spec.py` | `load_locked_spec`, `verify`, `SpecMismatchError` | 2 | **done** |
 | `load_adapter.py` | `canonicalize`, `load`, `load_all` | 2 | **done** |
-| `methods/dare.py` | `dare` | 3 | skeleton |
-| `methods/uniform.py` | `uniform_merge` | 3 | skeleton |
-| `methods/weighted_linear.py` | `weighted_linear_merge` | 3 | skeleton |
-| `methods/__init__.py` | `dare_uniform`, `dare_weighted` (compositions) | 3 | skeleton |
+| `methods/dare.py` | `dare` | 3 | **done** |
+| `methods/uniform.py` | `uniform_merge` | 3 | **done** |
+| `methods/weighted_linear.py` | `weighted_linear_merge` | 3 | **done** |
+| `methods/__init__.py` | `dare_uniform`, `dare_weighted` (compositions) | 3 | **done** |
 | `methods/ties.py` | `ties_merge` | 4 | skeleton |
 | `pipeline.py` | `merge_adapters` | 4 | skeleton |
 | `tests/test_pipeline_synthetic.py` | end-to-end CPU test | 4 | not created |

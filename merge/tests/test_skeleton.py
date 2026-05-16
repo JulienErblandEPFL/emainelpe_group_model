@@ -76,30 +76,6 @@ def test_eval_all_stubs_raise_stage_5() -> None:
 # Torch-dependent modules (skip if torch is missing)
 # ---------------------------------------------------------------------------
 
-def test_dare_stub_raises_stage_3() -> None:
-    pytest.importorskip("torch")
-    from merge.methods.dare import dare
-
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        dare({}, drop_rate=0.5)
-
-
-def test_uniform_merge_stub_raises_stage_3() -> None:
-    pytest.importorskip("torch")
-    from merge.methods.uniform import uniform_merge
-
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        uniform_merge([])
-
-
-def test_weighted_linear_merge_stub_raises_stage_3() -> None:
-    pytest.importorskip("torch")
-    from merge.methods.weighted_linear import weighted_linear_merge
-
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        weighted_linear_merge([], [])
-
-
 def test_ties_merge_stub_raises_stage_4() -> None:
     pytest.importorskip("torch")
     from merge.methods.ties import ties_merge
@@ -114,22 +90,6 @@ def test_adamerging_stub_raises_stage_7() -> None:
 
     with pytest.raises(NotImplementedError, match="Stage 7"):
         adamerging([], "Qwen/Qwen3-1.7B", [], Path("dummy"))
-
-
-def test_dare_uniform_stub_raises_stage_3() -> None:
-    pytest.importorskip("torch")
-    from merge.methods import dare_uniform
-
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        dare_uniform([])
-
-
-def test_dare_weighted_stub_raises_stage_3() -> None:
-    pytest.importorskip("torch")
-    from merge.methods import dare_weighted
-
-    with pytest.raises(NotImplementedError, match="Stage 3"):
-        dare_weighted([], [])
 
 
 def test_method_registry_has_all_five_methods() -> None:
