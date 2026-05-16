@@ -25,3 +25,6 @@ outputs/
 # Cache
 .cache/
 .hf_cache/
+
+# Personal launcher (per-teammate GASPAR/GROUP values)
+docker/submit.sh
