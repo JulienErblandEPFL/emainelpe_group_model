@@ -36,6 +36,11 @@ lora:
     - up_proj
     - down_proj
 
+  # CRITICAL: modules_to_save MUST stay unset/null.
+  # Setting it (e.g. to ["embed_tokens", "lm_head"]) introduces full-rank
+  # tensors that break additive task-vector merging (DARE/AdaMerging/TIES).
+  modules_to_save: null
+
 # Tokenization — LOCKED
 max_seq_length: 4096        # CI eval cap; train at the same length
 eos_token: "<|im_end|>"     # Qwen3 chat-template terminator
