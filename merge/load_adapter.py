@@ -65,6 +65,33 @@ def canonicalize(name: str) -> str:
     return body
 
 
+def decanonicalize(canonical_name: str, factor: str) -> str:
+    """Inverse of :func:`canonicalize`.
+
+    Builds the full PEFT safetensors key from a canonical layer+module
+    identifier and a factor name. Used by the pipeline to write merged
+    adapter weights back in PEFT-readable format.
+
+    Example::
+
+        decanonicalize("model.layers.0.self_attn.q_proj", "lora_A")
+        # -> "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+
+    Args:
+        canonical_name: A canonical name as produced by :func:`canonicalize`.
+        factor: Either ``"lora_A"`` or ``"lora_B"``.
+
+    Returns:
+        The full PEFT parameter name.
+
+    Raises:
+        ValueError: if ``factor`` is not one of the two allowed values.
+    """
+    if factor not in ("lora_A", "lora_B"):
+        raise ValueError(f"factor must be 'lora_A' or 'lora_B', got {factor!r}")
+    return f"{_PEFT_PREFIX}{canonical_name}.{factor}.default.weight"
+
+
 def _which_factor(name: str) -> str:
     """Return 'A' or 'B' from a LoRA factor weight name."""
     m = _PEFT_SUFFIX_RE.search(name)

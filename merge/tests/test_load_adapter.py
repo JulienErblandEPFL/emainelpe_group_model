@@ -67,6 +67,29 @@ def test_canonicalize_unexpected_name_raises() -> None:
         canonicalize("base_model.model.model.layers.0.self_attn.q_proj.weight")
 
 
+def test_canonicalize_decanonicalize_round_trip() -> None:
+    """canonicalize is the left inverse of decanonicalize for any factor."""
+    from merge.load_adapter import canonicalize, decanonicalize
+
+    canonicals = [
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.27.mlp.gate_proj",
+        "model.layers.5.self_attn.o_proj",
+        "model.layers.12.mlp.down_proj",
+    ]
+    for c in canonicals:
+        for factor in ("lora_A", "lora_B"):
+            full = decanonicalize(c, factor)
+            assert canonicalize(full) == c, f"round-trip failed for {c!r}, factor {factor!r}"
+
+
+def test_decanonicalize_rejects_bad_factor() -> None:
+    from merge.load_adapter import decanonicalize
+
+    with pytest.raises(ValueError, match=r"factor must be"):
+        decanonicalize("model.layers.0.self_attn.q_proj", "lora_C")
+
+
 # ---------------------------------------------------------------------------
 # load() — torch-required
 # ---------------------------------------------------------------------------

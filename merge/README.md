@@ -101,14 +101,14 @@ Update this table as stages land. Single source of truth.
 | Module | Function(s) | Stage | Status |
 |---|---|---|---|
 | `verify_spec.py` | `load_locked_spec`, `verify`, `SpecMismatchError` | 2 | **done** |
-| `load_adapter.py` | `canonicalize`, `load`, `load_all` | 2 | **done** |
+| `load_adapter.py` | `canonicalize`, `decanonicalize`, `load`, `load_all` | 2 + 4 | **done** |
 | `methods/dare.py` | `dare` | 3 | **done** |
 | `methods/uniform.py` | `uniform_merge` | 3 | **done** |
 | `methods/weighted_linear.py` | `weighted_linear_merge` | 3 | **done** |
 | `methods/__init__.py` | `dare_uniform`, `dare_weighted` (compositions) | 3 | **done** |
-| `methods/ties.py` | `ties_merge` | 4 | skeleton |
-| `pipeline.py` | `merge_adapters` | 4 | skeleton |
-| `tests/test_pipeline_synthetic.py` | end-to-end CPU test | 4 | not created |
+| `methods/ties.py` | `ties_merge` | 4 | **done** |
+| `pipeline.py` | `merge_adapters`, `svd_factor` | 4 | **done** |
+| `tests/test_pipeline_synthetic.py` | end-to-end CPU test | 4 | **done** |
 | `infer.py` | `generate_completions`, `generate_for_validation_set` | 5 | skeleton |
 | `publish.py` | `publish_adapter` | 5 | skeleton |
 | `eval_all.py` | `evaluate_completions`, `four_domain_average` | 5 | skeleton |

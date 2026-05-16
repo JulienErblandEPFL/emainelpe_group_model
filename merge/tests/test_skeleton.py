@@ -32,19 +32,6 @@ def test_merge_package_imports() -> None:
     assert merge.__version__, "merge.__version__ should be a non-empty string"
 
 
-def test_pipeline_stub_raises_stage_4() -> None:
-    from merge import pipeline
-
-    with pytest.raises(NotImplementedError, match="Stage 4"):
-        pipeline.merge_adapters(
-            adapter_repos=[],
-            method="uniform",
-            base_model_repo="Qwen/Qwen3-1.7B",
-            locked_spec_path=Path("dummy.yaml"),
-            output_dir=Path("dummy_out"),
-        )
-
-
 def test_infer_stubs_raise_stage_5() -> None:
     from merge import infer
 
@@ -75,14 +62,6 @@ def test_eval_all_stubs_raise_stage_5() -> None:
 # ---------------------------------------------------------------------------
 # Torch-dependent modules (skip if torch is missing)
 # ---------------------------------------------------------------------------
-
-def test_ties_merge_stub_raises_stage_4() -> None:
-    pytest.importorskip("torch")
-    from merge.methods.ties import ties_merge
-
-    with pytest.raises(NotImplementedError, match="Stage 4"):
-        ties_merge([])
-
 
 def test_adamerging_stub_raises_stage_7() -> None:
     pytest.importorskip("torch")

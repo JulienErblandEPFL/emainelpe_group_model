@@ -1,0 +1,236 @@
+"""
+Tests for ``merge.pipeline.merge_adapters`` — Stage 4 orchestrator.
+
+Exercises every method through the registry, plus the error paths
+(unknown method, stub method, missing adapters, spec mismatch, non-empty
+output dir).
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Happy paths — one per method
+# ---------------------------------------------------------------------------
+
+def test_pipeline_uniform_with_synthetic_adapters(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.load_adapter import load
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    returned = merge_adapters(
+        synthetic_adapters_dir,
+        method="uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+    )
+    assert returned == out_dir
+    assert (out_dir / "adapter_config.json").exists()
+    assert (out_dir / "adapter_model.safetensors").exists()
+
+    cfg = json.loads((out_dir / "adapter_config.json").read_text())
+    assert cfg["inference_mode"] is False
+    assert cfg["r"] == 32
+    assert cfg["lora_alpha"] == 64
+
+    # Reload round-trips into a task vector dict with the same canonical keys.
+    reloaded = load(out_dir)
+    one_input = load(synthetic_adapters_dir / "math")
+    assert set(reloaded.keys()) == set(one_input.keys())
+
+
+def test_pipeline_dare_uniform_with_synthetic_adapters(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="dare_uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        method_kwargs={"drop_rate": 0.5, "seed": 42},
+    )
+    assert (out_dir / "adapter_config.json").exists()
+    assert (out_dir / "adapter_model.safetensors").exists()
+
+
+def test_pipeline_dare_weighted_with_synthetic_adapters(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="dare_weighted",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        method_kwargs={"weights": [0.4, 0.3, 0.2, 0.1], "drop_rate": 0.5, "seed": 1},
+    )
+    assert (out_dir / "adapter_config.json").exists()
+
+
+def test_pipeline_ties_with_synthetic_adapters(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="ties",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        method_kwargs={"trim_ratio": 0.5},
+    )
+    assert (out_dir / "adapter_config.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Error paths
+# ---------------------------------------------------------------------------
+
+def test_pipeline_unknown_method_raises_key_error(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    from merge.pipeline import merge_adapters
+
+    with pytest.raises(KeyError, match=r"not_a_method"):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="not_a_method",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_adamerging_raises_not_implemented(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    from merge.pipeline import merge_adapters
+
+    with pytest.raises(NotImplementedError, match=r"Stage 7"):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="adamerging",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_missing_adapter_raises(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    import shutil
+    from merge.pipeline import merge_adapters
+
+    shutil.rmtree(synthetic_adapters_dir / "safety")
+    with pytest.raises(FileNotFoundError, match=r"safety"):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="uniform",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_diverging_adapter_raises_spec_mismatch(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    from merge.pipeline import merge_adapters
+    from merge.verify_spec import SpecMismatchError
+
+    cfg_path = synthetic_adapters_dir / "safety" / "adapter_config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["r"] = 16
+    cfg_path.write_text(json.dumps(cfg))
+
+    with pytest.raises(SpecMismatchError):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="uniform",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_output_exists_and_nonempty_raises(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    out_dir.mkdir()
+    (out_dir / "something.txt").write_text("hi")
+    with pytest.raises(FileExistsError):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="uniform",
+            output_dir=out_dir,
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_output_exists_but_empty_succeeds(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    out_dir.mkdir()
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+    )
+    assert (out_dir / "adapter_config.json").exists()
+
+
+def test_pipeline_reproducible_with_seed(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """Same seed → bit-identical lora_A/lora_B weights in the output."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from safetensors.torch import load_file
+    from merge.pipeline import merge_adapters
+
+    out_a = tmp_path / "a"
+    out_b = tmp_path / "b"
+    common_kwargs = dict(
+        method="dare_uniform",
+        locked_spec_path=lora_yaml_path,
+        method_kwargs={"drop_rate": 0.5, "seed": 42},
+    )
+    merge_adapters(synthetic_adapters_dir, output_dir=out_a, **common_kwargs)
+    merge_adapters(synthetic_adapters_dir, output_dir=out_b, **common_kwargs)
+
+    a_state = load_file(str(out_a / "adapter_model.safetensors"), device="cpu")
+    b_state = load_file(str(out_b / "adapter_model.safetensors"), device="cpu")
+    assert set(a_state.keys()) == set(b_state.keys())
+    for key in a_state:
+        assert torch.equal(a_state[key], b_state[key]), f"{key} differs across runs"
