@@ -23,10 +23,10 @@ import torch
 
 
 def adamerging(
-    task_vectors: list[dict[str, torch.Tensor]],
-    base_model_repo: str,
-    validation_jsonl_paths: list[Path],
-    chat_template_path: Path,
+    task_vectors: list[dict[str, torch.Tensor]] | None = None,
+    base_model_repo: str = "",
+    validation_jsonl_paths: list[Path] | None = None,
+    chat_template_path: Path | None = None,
     *,
     lr: float = 1e-3,
     n_steps: int = 500,

@@ -268,6 +268,7 @@ for the final 4-page report.
 ### Verified (cluster)
 
 - TBD — pending next `git pull && pytest merge/tests/ -v` on RCP.
+- Fixed: SVD outputs needed `.contiguous()` before safetensors save; adamerging stub needed raise-first to avoid TypeError on minimal kwargs.
 
 ### Open questions
 

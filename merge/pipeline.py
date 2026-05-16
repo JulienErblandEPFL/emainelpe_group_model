@@ -170,6 +170,9 @@ def merge_adapters(
 
     # Save weights then config. Order is incidental, but config-last lets a
     # mid-run failure leave only the safetensors file (clearly broken).
+    # safetensors refuses to save non-contiguous tensors (views, slices, broadcasts).
+    # SVD factorization in svd_factor() produces views; force a copy here.
+    peft_state = {k: v.contiguous() for k, v in peft_state.items()}
     safetensors_save_file(peft_state, str(output_dir / "adapter_model.safetensors"))
 
     # The four adapters are byte-identical on the 8 load-bearing fields; using
