@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor
+*~
+*#*
+.#*
+.idea/
+.vscode/
+
+# Local merge artifacts (never commit real adapters or merged outputs)
+loras/
+merged/
+outputs/
+
+# Cache
+.cache/
+.hf_cache/
