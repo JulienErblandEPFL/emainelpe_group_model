@@ -32,31 +32,11 @@ def test_merge_package_imports() -> None:
     assert merge.__version__, "merge.__version__ should be a non-empty string"
 
 
-def test_infer_stubs_raise_stage_5() -> None:
-    from merge import infer
-
-    with pytest.raises(NotImplementedError, match="Stage 5"):
-        infer.generate_completions(Path("dummy"), "Qwen/Qwen3-1.7B", [])
-    with pytest.raises(NotImplementedError, match="Stage 5"):
-        infer.generate_for_validation_set(
-            Path("dummy"), "Qwen/Qwen3-1.7B", Path("dummy_vs"), Path("dummy_out")
-        )
-
-
 def test_publish_stub_raises_stage_5() -> None:
     from merge import publish
 
     with pytest.raises(NotImplementedError, match="Stage 5"):
         publish.publish_adapter(Path("dummy"), "cs-552-2026-emainelpe/group_model")
-
-
-def test_eval_all_stubs_raise_stage_5() -> None:
-    from merge import eval_all
-
-    with pytest.raises(NotImplementedError, match="Stage 5"):
-        eval_all.evaluate_completions(Path("dummy"), Path("dummy_vs"))
-    with pytest.raises(NotImplementedError, match="Stage 5"):
-        eval_all.four_domain_average({})
 
 
 # ---------------------------------------------------------------------------

@@ -293,6 +293,51 @@ def test_pipeline_output_exists_but_empty_succeeds(
     assert (out_dir / "adapter_config.json").exists()
 
 
+def test_pipeline_writes_generation_config_when_provided(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """If ``generation_config`` is provided, ``output_dir`` contains
+    ``generation_config.json``."""
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.generation_config import make_generation_config
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    gen_config = make_generation_config(temperature=0.3)
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        generation_config=gen_config,
+    )
+    gen_path = out_dir / "generation_config.json"
+    assert gen_path.exists()
+    loaded = json.loads(gen_path.read_text())
+    assert loaded["temperature"] == 0.3
+    assert loaded["bos_token_id"] == 151643
+
+
+def test_pipeline_no_generation_config_when_omitted(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """If ``generation_config`` is ``None`` (default), no
+    ``generation_config.json`` is written."""
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+    )
+    assert not (out_dir / "generation_config.json").exists()
+
+
 def test_pipeline_reproducible_with_seed(
     synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
 ) -> None:

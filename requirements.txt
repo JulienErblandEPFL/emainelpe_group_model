@@ -26,3 +26,7 @@ pytest>=7.0
 # path, so a torch-free laptop install does not need them.
 datasets>=2.14
 transformers>=4.40
+
+# Stage 5c.1 addition (vLLM-based eval). Lazy-imported by `merge/infer.py`
+# and `merge/eval_all.py` — torch-free laptops do not need it for tests.
+vllm>=0.6.0

@@ -98,6 +98,7 @@ def merge_adapters(
     output_dir: Path,
     locked_spec_path: Path | None = None,
     method_kwargs: dict[str, Any] | None = None,
+    generation_config: dict[str, Any] | None = None,
 ) -> Path:
     """Run the full merge pipeline and write a PEFT-loadable adapter directory.
 
@@ -117,10 +118,18 @@ def merge_adapters(
             ``{"drop_rate": 0.5, "seed": 42}`` for DARE variants;
             ``{"weights": [...]}``  for ``dare_weighted``;
             ``{"trim_ratio": 0.5}`` for TIES).
+        generation_config: If provided, written to
+            ``output_dir/generation_config.json`` as part of the merged
+            adapter directory. The dict structure should match the CS-552
+            project's required schema (use
+            :func:`merge.generation_config.make_generation_config` to
+            construct). If ``None``, no ``generation_config.json`` is
+            written.
 
     Returns:
-        The ``output_dir`` path (now populated with ``adapter_config.json``
-        and ``adapter_model.safetensors``).
+        The ``output_dir`` path (now populated with ``adapter_config.json``,
+        ``adapter_model.safetensors``, and optionally
+        ``generation_config.json``).
 
     Raises:
         FileNotFoundError: if ``adapters_dir`` or its expected subdirs are
@@ -179,6 +188,12 @@ def merge_adapters(
     # math's config carries through any teammate-supplied PEFT bookkeeping too.
     source = adapters_dir / CANONICAL_DOMAINS[0]
     _copy_adapter_config(source, output_dir)
+
+    if generation_config is not None:
+        gen_config_path = output_dir / "generation_config.json"
+        with gen_config_path.open("w") as f:
+            json.dump(generation_config, f, indent=2)
+        logger.info("Wrote generation_config.json to %s", gen_config_path)
 
     return output_dir
 

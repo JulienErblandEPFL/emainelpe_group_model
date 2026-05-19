@@ -50,7 +50,9 @@ entirely.
 - `merge/methods/__init__.py` — `METHOD_REGISTRY` dispatches a method-name
   string to its callable
 - `merge/pipeline.py` — orchestrator (stub, Stage 4)
-- `merge/infer.py`, `merge/publish.py`, `merge/eval_all.py` — stubs (Stage 5)
+- `merge/infer.py` — vLLM-based n=8 inference per benchmark (Stage 5c.1)
+- `merge/eval_all.py` — multi-benchmark scorer + failure classifier (Stage 5c.1)
+- `merge/publish.py` — HF push (stub, Stage 5d)
 - `merge/tests/` — CPU-runnable tests; torch-dependent tests use
   `pytest.importorskip("torch")`
 
@@ -75,6 +77,11 @@ entirely.
   PEFT-format merged adapter, ready for `load()` round-trip.
 - **Dependencies**: Python dependencies for the merge subdir are listed in
   `requirements.txt` at the repo root.
+- **Generation config**: structure is locked (token IDs from project
+  description), values are tunable via
+  `merge.generation_config.make_generation_config(...)`. Eval reads via
+  hierarchical fallback in `load_generation_config` (adapter dir → repo
+  root → Qwen3 defaults).
 - **Runnable scripts** live in `scripts/` at the repo root:
   `fetch_adamerging_data.py` (one-shot HF dataset pre-download),
   `smoke_adamerging.py` (cluster smoke for the AdaMerging pipeline).

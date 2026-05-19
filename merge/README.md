@@ -131,9 +131,11 @@ Update this table as stages land. Single source of truth.
 | `tests/test_data_unlabeled.py` | CPU unit tests for dataset config + cache check | 5b | **done** |
 | `../scripts/fetch_adamerging_data.py` | pre-download the 4 unlabeled datasets | 5b | **done** |
 | `../scripts/smoke_adamerging.py` | cluster smoke: random Qwen3 adapters → dare_adamerging | 5b | **done** |
-| `infer.py` | `generate_completions`, `generate_for_validation_set` | 5c | skeleton |
+| `infer.py` | `run_inference`, `load_validation_jsonl`, `InferenceConfig` | 5c.1 | **done** |
+| `eval_all.py` | `evaluate_all_benchmarks`, `evaluate_one_benchmark`, `classify_completion`, `classify_problem_failure` | 5c.1 | **done** |
+| `tests/test_failure_classification.py` | failure taxonomy unit tests | 5c.1 | **done** |
+| `tests/test_eval_io.py` | JSONL parsing + dataclass IO tests | 5c.1 | **done** |
 | `publish.py` | `publish_adapter` | 5d | skeleton |
-| `eval_all.py` | `evaluate_completions`, `four_domain_average` | 5c | skeleton |
 
 ## Stage 5b: Real-Qwen3 plumbing for AdaMerging
 
@@ -163,6 +165,62 @@ Cluster workflow:
 python scripts/fetch_adamerging_data.py
 python scripts/smoke_adamerging.py --max-steps 50
 ```
+
+## Stage 5c.1: Inference + multi-benchmark eval
+
+- **`merge/infer.py`** — vLLM-based n=8 inference for one benchmark.
+  Renders prompts through the Qwen3 chat template
+  (`add_generation_prompt=True`), calls `vllm.LLM.generate(...)` with the
+  merged adapter passed as a `LoRARequest`, and writes a generations JSONL
+  shaped exactly like the input `evaluate.score` consumes.
+- **`merge/eval_all.py`** — orchestrator: loads vLLM once
+  (`enable_lora=True, max_lora_rank=32`), runs all 4 benchmarks, scores
+  via the existing `evaluate/*` helpers (pass@1, pass@8), and classifies
+  every pass@8=0 failure into one of 7 categories.
+- **Failure taxonomy** (`merge.eval_all.FailureCategory`):
+  `no_boxed`, `empty_boxed`, `wrong_answer`, `malformed_answer`,
+  `truncated`, `refusal`, `mixed`. Per-problem detail (with the 8
+  completions inline) is saved to `failures_<benchmark>.json`.
+
+Output layout for one evaluation run:
+
+```
+<output_dir>/
+    scorecard.json
+    generations_{math,general_knowledge,safety,multilingual}.jsonl
+    failures_{math,general_knowledge,safety,multilingual}.json
+```
+
+Workflow:
+
+```python
+from pathlib import Path
+from merge.eval_all import evaluate_all_benchmarks
+
+results = evaluate_all_benchmarks(
+    merged_adapter_dir=Path("outputs/merged_v1/"),
+    base_model_repo="Qwen/Qwen3-1.7B",
+    output_dir=Path("outputs/eval_v1/"),
+    validation_samples_dir=Path("validation_samples/"),
+)
+```
+
+**Sampling params resolution.** When `config=None` is passed to
+`evaluate_all_benchmarks`, sampling params are resolved through a
+hierarchical fallback (highest priority first):
+
+1. Explicit `config: InferenceConfig` argument.
+2. `<merged_adapter_dir>/generation_config.json` (written by
+   `pipeline.merge_adapters` when a `generation_config` dict is passed in).
+3. `<repo_root>/generation_config.json` (team-wide per-run override; absent
+   for now — falls through).
+4. Qwen3 defaults (`temperature=0.7`, `top_p=0.8`, `top_k=20`,
+   `max_new_tokens=16384`), built via
+   `merge.generation_config.make_generation_config()`.
+
+This ensures eval measures what CI would measure for any merged model
+shipping its own `generation_config.json`. The bake-off pipeline writes
+that file per merge config via `pipeline.merge_adapters(..., generation_config=...)`.
 
 ## Out of scope for `merge/`
 

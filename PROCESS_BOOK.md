@@ -508,6 +508,152 @@ for the final 4-page report.
 
 ---
 
+## Day 6 — 2026-05-19 — Stage 5c.1: vLLM-based eval infrastructure
+
+### What happened
+
+- Built `merge/infer.py` (vLLM-based n=8 inference for a single benchmark).
+  `run_inference(vllm_model, lora_request, benchmark, validation_jsonl,
+  output_jsonl, config)` renders prompts via the Qwen3 chat template
+  (`add_generation_prompt=True`), calls `vllm_model.generate(...)` with a
+  single `SamplingParams(n=config.n, ...)`, and writes a JSONL shaped
+  exactly like `evaluate.score` consumes. The vLLM model is owned by the
+  caller — `infer.py` never loads or releases it.
+- Built `merge/eval_all.py` (multi-benchmark orchestrator with failure
+  classification). Top-level entry: `evaluate_all_benchmarks(adapter_dir,
+  base_model_repo, output_dir, validation_samples_dir, ...)`. Loads
+  `vllm.LLM(enable_lora=True, max_lora_rank=32, dtype="bfloat16")` once,
+  attaches the merged adapter via `LoRARequest`, then loops the 4
+  canonical domains (`math`, `general_knowledge`, `safety`, `multilingual`),
+  scoring with the existing `evaluate/*` helpers and classifying each
+  pass@8=0 problem into one of 7 categories.
+- Failure taxonomy: `no_boxed`, `empty_boxed`, `wrong_answer`,
+  `malformed_answer`, `truncated`, `refusal`, `mixed`. Per-problem detail
+  saved with the 8 completions inline so debugging is concrete.
+- Per-completion priority order: REFUSAL > TRUNCATED > NO_BOXED >
+  EMPTY_BOXED > [extract + compare]. WRONG_ANSWER vs MALFORMED_ANSWER
+  discriminator is a one-line numeric-shape check: if the expected
+  answer parses as a number but the extracted answer does not, it's
+  malformed (e.g. `\boxed{x}` vs gold `42`); otherwise it's wrong.
+- Tests added (torch-free):
+  `tests/test_failure_classification.py` (17 tests covering all 7
+  categories, refusal priority, strict-majority and mixed aggregation,
+  knowledge MCQ paths, edge cases like multiple boxed + trailing
+  whitespace), and `tests/test_eval_io.py` (10 tests covering JSONL
+  parsing with `prompt`/`answer` vs `problem`/`solution` field names,
+  `InferenceConfig` defaults, dataclass round-trips through json).
+- Removed the obsolete `test_infer_stubs_raise_stage_5` and
+  `test_eval_all_stubs_raise_stage_5` from `tests/test_skeleton.py`
+  (those modules are real now). Kept the `publish.py` stub test.
+
+### Decisions and rationale
+
+- **vLLM with `enable_lora=True`**, not `merge_and_unload + full model
+  push` at eval time. Adapter-on-base is more memory-efficient and lets
+  us swap adapters between bake-off runs without reloading base.
+  `merge_and_unload` happens only at the final HF push (Stage 5d).
+- **vLLM loaded once per `evaluate_all_benchmarks`** call, reused across
+  4 benchmarks. Avoids 4× cold start (~30-60s each).
+- **`n=8` via vLLM `SamplingParams(n=8, ...)`** — single API call per
+  problem yields both pass@1 and pass@8 from the same generation pool.
+- **Scoring uses `evaluate.benchmarks.{extract,is_correct}_benchmark_answer`
+  + `evaluate.pass_at_k.compute_pass_at_k_for_dataset`** directly, not
+  the `evaluate.score` CLI wrapper. Same logic, no SystemExit coupling.
+- **Canonical domain → method mapping**: `_DOMAIN_TO_METHOD` maps our
+  `general_knowledge` to evaluate's `knowledge`; math/safety/multilingual
+  all use `boxed`. The mapping is private to `eval_all.py`.
+- **Failure detail = category + the 8 completions inline.** Output file
+  gets large (~100KB per benchmark) but the debugging value is real.
+  Without the actual completions it's hard to tell why a problem failed.
+- **`max_tokens=2048`** for eval (vs the project's 16384 CI cap). For
+  thinking-mode the model typically uses 1-2k tokens; 2048 covers CoT +
+  boxed answer with margin. CLI override remains possible.
+- **Truncation heuristic**: `tokens_used == max_tokens_limit` AND no
+  closing `\boxed{}`. Rare edge case of hitting exactly `max_tokens`
+  with a valid answer is acceptable misclassification.
+- **REFUSAL has priority over correctness in `classify_completion`.**
+  This is consistent within the pass@8=0 contract: by the time
+  `classify_problem_failure` runs, the scorer has already confirmed all
+  8 completions are wrong, so any refusal-shaped phrase is meaningful
+  evidence. The unit test exercises the per-completion path with an
+  artificially correct refusal to lock the priority in.
+
+### Verified (laptop)
+
+- All Stage 5c.1 IO + classification tests pass torch-free (run
+  separately and bundled into the full suite). Total test count:
+  131 → 161 (+30): 20 failure-classification + 12 IO tests, minus 2
+  obsolete stub tests removed from `tests/test_skeleton.py`.
+- Laptop pytest result: `64 passed, 97 skipped in 0.52s`.
+- `python -c "from merge.eval_all import FailureCategory; print(list(FailureCategory))"`
+  works on torch-free laptop (no vLLM needed for this import).
+- `git status` shows only files in the allowed list.
+
+### Verified (cluster) [TBD]
+
+- `pip install vllm` + `pytest merge/tests/ -v` (should be ~161 tests,
+  most of the currently-skipped torch-dependent tests will execute).
+- `evaluate_all_benchmarks(...)` on a smoke merged adapter against the
+  40-problem validation snapshot. Expected: ~10-15 min wall clock for
+  n=8 across 40 problems. With random-init adapters pass@k will be
+  near zero — point is to verify the pipeline runs end-to-end.
+
+### Open questions
+
+- vLLM's `enable_lora` requires the adapter to be in PEFT format
+  (which our `pipeline.merge_adapters` output is) and at the locked
+  rank (`max_lora_rank=32`). Should match locked spec; verify on the
+  first cluster run.
+- Stage 5b smoke had unexplained ~5-minute tail latency at cleanup.
+  Worth checking whether `evaluate_all_benchmarks` exhibits the same
+  on `del llm`.
+- Bake-off orchestration (`scripts/run_bakeoff.py`) is Stage 5c.2;
+  unblocked once 5c.1 cluster smoke passes.
+
+---
+
+## Day 6 follow-up — Generation config handling
+
+**Issue raised:** Stage 5c.1's `InferenceConfig` hardcoded Qwen3 defaults
+(`temperature=0.7`, `top_p=0.8`, `top_k=20`) instead of reading the merged
+adapter's `generation_config.json`. This meant eval would not match what
+CI would measure for a model shipping a custom config.
+
+**Fix:**
+
+- New module `merge/generation_config.py` with `make_generation_config(...)`
+  (project-schema-compliant dict constructor) and `load_generation_config(...)`
+  (hierarchical fallback loader).
+- `pipeline.merge_adapters` accepts optional `generation_config: dict | None`.
+  If provided, written as `generation_config.json` in the output dir.
+- `evaluate_all_benchmarks` uses `load_generation_config` when `config=None`.
+  Priority: explicit arg → `merged_adapter_dir/generation_config.json`
+  → `repo_root/generation_config.json` → Qwen3 defaults.
+- `InferenceConfig.from_generation_config_dict` classmethod for the
+  dict→dataclass conversion.
+
+**Design rationale:**
+
+- Structure is locked (project mandate): `bos/eos/pad` token IDs are Qwen3
+  constants (151643 / [151645, 151643] / 151643), `do_sample=true`,
+  `transformers_version="4.51.0"`.
+- Values (`temperature`, `top_p`, `top_k`, `max_new_tokens`) are bake-off
+  hyperparameters and not team-locked.
+- First bake-off sweep: `temperature ∈ {0.0, 0.3, 0.7}`, `top_p=0.8`,
+  `top_k=20` held constant, `max_new_tokens=16384`.
+- No team-locked `generation_config.json` at the repo root yet — falls
+  through to defaults until we add one.
+
+**Tests:** 18 new tests covering `make_generation_config` validation,
+`load_generation_config` priority order, `InferenceConfig` dict
+conversion, and `pipeline.merge_adapters` with/without `generation_config`.
+
+**Verified:** All new tests pass on torch-free laptop. Cluster eval
+smoke needs a fresh run to verify the fallback hierarchy end-to-end
+(next run).
+
+---
+
 ## Open questions, blockers, decisions to revisit
 
 Running bulleted list. Items may be marked **resolved** but are never
@@ -528,8 +674,11 @@ deleted.
   DARE-based methods underperform on the May 24 milestone.
 - **Deferred**: TIES default `trim_ratio=0.5`. May want to sweep
   alongside DARE `drop_rate` once both are implemented.
-- **Open**: Generation config for the group model — whose values to
-  use, or new ones? Decision deferred to Stage 5.
+- **Resolved (Day 6 follow-up)**: Generation config for the group model
+  — structure is locked by the project description (token IDs, do_sample,
+  transformers version); sampling values are bake-off hyperparameters
+  written by `pipeline.merge_adapters(..., generation_config=...)` and
+  read via hierarchical fallback at eval time.
 - **Math v6 in flight**: 200k OMI2 SFT training in parallel. If v6
   lifts above v5 on CI, swap v5 → v6 as the math input before Stage 6
   (milestone push). Otherwise keep v5.
