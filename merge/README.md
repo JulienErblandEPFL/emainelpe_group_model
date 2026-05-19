@@ -83,6 +83,13 @@ The six user-facing methods, with implementation stage:
 > for the contract. Stage 5b will build the real-Qwen3 helpers (PEFT-hook
 > forward + unlabeled-data sampler).
 
+## Dependencies
+
+Dependencies for the merge subdir are listed in `requirements.txt` at the
+repo root. The cluster docker image has them preinstalled; teammates running
+locally can `pip install -r requirements.txt` (use the PyTorch CPU index for
+laptop installs — see the comment at the top of that file).
+
 ## How to run the synthetic end-to-end test
 
 The Stage-4 end-to-end test will live at `merge/tests/test_pipeline_synthetic.py`

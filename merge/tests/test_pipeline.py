@@ -153,19 +153,70 @@ def test_pipeline_unknown_method_raises_key_error(
         )
 
 
-def test_pipeline_adamerging_raises_not_implemented(
+def test_pipeline_adamerging_requires_forward_fn_and_data_iter(
     synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
 ) -> None:
+    """adamerging requires forward_fn and data_iter in method_kwargs;
+    calling without them raises TypeError mentioning the missing args."""
     pytest.importorskip("torch")
     from merge.pipeline import merge_adapters
 
-    with pytest.raises(NotImplementedError, match=r"Stage 7"):
+    with pytest.raises(TypeError, match=r"forward_fn|data_iter"):
         merge_adapters(
             synthetic_adapters_dir,
             method="adamerging",
             output_dir=tmp_path / "merged",
             locked_spec_path=lora_yaml_path,
         )
+
+
+def test_pipeline_dare_adamerging_requires_forward_fn_and_data_iter(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """dare_adamerging requires forward_fn and data_iter in method_kwargs."""
+    pytest.importorskip("torch")
+    from merge.pipeline import merge_adapters
+
+    with pytest.raises(TypeError, match=r"forward_fn|data_iter"):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="dare_adamerging",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_dare_adamerging_with_synthetic_forward(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """End-to-end: pipeline dispatch through dare_adamerging produces a
+    valid merged adapter directory."""
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.pipeline import merge_adapters
+    from merge.tests.fixtures.adamerging_helpers import (
+        make_synthetic_forward_fn,
+        make_synthetic_data_iter,
+    )
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="dare_adamerging",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        method_kwargs={
+            "forward_fn": make_synthetic_forward_fn(seed=0),
+            "data_iter": make_synthetic_data_iter(n_batches=30, seed=0),
+            "drop_rate": 0.5,
+            "seed": 42,
+            "max_steps": 20,
+            "early_stop_patience": 200,
+        },
+    )
+
+    assert (out_dir / "adapter_config.json").exists()
+    assert (out_dir / "adapter_model.safetensors").exists()
 
 
 def test_pipeline_missing_adapter_raises(

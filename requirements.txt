@@ -1,0 +1,20 @@
+# Python dependencies for the `merge/` subdir.
+#
+# Install with:   pip install -r requirements.txt
+#
+# The course cluster docker image (ayushkumartarun/course-cs-552-standard:v1)
+# already has these (and many more) preinstalled. This file exists for
+# teammates setting up the merge subdir locally, or for any environment
+# that does not start from the course image.
+#
+# For CPU-only laptop installs, use the PyTorch CPU wheel index:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# Loose pins (>=) on purpose: the cluster image has specific versions and we
+# don't want to fight it. Only packages actually imported by the merge subdir
+# are listed; Stage 5b will add `datasets` when unlabeled-data loading lands.
+
+torch>=2.0
+safetensors>=0.4
+pyyaml>=6.0
+pytest>=7.0

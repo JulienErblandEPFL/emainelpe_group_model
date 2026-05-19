@@ -73,6 +73,8 @@ entirely.
 - **Pipeline I/O contract**: input = local directory of PEFT-format
   adapters (no HF download in the pipeline itself). Output = local
   PEFT-format merged adapter, ready for `load()` round-trip.
+- **Dependencies**: Python dependencies for the merge subdir are listed in
+  `requirements.txt` at the repo root.
 
 ## Files to NEVER touch from a coding task
 
