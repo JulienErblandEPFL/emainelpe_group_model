@@ -377,6 +377,137 @@ for the final 4-page report.
 
 ---
 
+## Day 5 — 2026-05-19 — Stage 5b: Real-Qwen3 plumbing for AdaMerging
+
+### What happened
+
+- Built `merge/data/unlabeled.py`: a `DatasetConfig` dataclass, the
+  4-element `UNLABELED_DATASETS` constant (GSM8K `main/train`, MMLU
+  `all/auxiliary_train`, XSTest `prompts` filtered to `safe_*`, MGSM
+  `en/test`), `assert_cache_exists()` heuristic check, and
+  `make_unlabeled_iter()` that pre-tokenizes via the Qwen3 chat
+  template, packs into uniform `batch_size`-sized right-padded batches,
+  and cycles per-domain so we never run dry. Round-robin domain order
+  matches `CANONICAL_DOMAINS`.
+- Built `merge/qwen3_forward.py`: loads Qwen3-1.7B once via
+  `AutoModelForCausalLM`, freezes parameters, builds the
+  `module_name → canonical_name` map (currently identity for Qwen3),
+  and returns `(forward_fn, cleanup)`. `forward_fn` enters a context
+  manager that installs **forward post-hooks** on each LoRA-targetable
+  Linear; each hook returns `output + F.linear(input, merged[canon],
+  bias=None)`. Differentiable w.r.t. the AdaMerging coefficients
+  without touching base weights.
+- Built `scripts/fetch_adamerging_data.py`: idempotent pre-download.
+  Logs per-dataset size, applies the XSTest type filter so the user
+  sees the post-filter count, accumulates failures and exits non-zero
+  if any dataset fails to fetch.
+- Built `scripts/smoke_adamerging.py`: 5-step orchestrator —
+  cache check → tokenizer load → forward callable + base model load →
+  data iter → 4 random Qwen3-sized adapters → `merge_adapters(method=
+  "dare_adamerging", ...)`. Asserts the merged adapter directory is
+  well-formed. Disables early stopping by setting
+  `early_stop_patience = max_steps + 1` so the smoke run touches every
+  configured step.
+- Added `merge/tests/fixtures/qwen3_adapter.py`:
+  `make_random_qwen3_adapter()` builds a Qwen3-1.7B-shaped PEFT
+  adapter (28 layers, hidden=2048, intermediate=6144, GQA with 8 KV
+  heads → k/v out dim = 1024, r=32, bf16). Random init scaled to
+  `1/√r` so the implied ΔW has unit-ish magnitude. Used only by the
+  smoke script — too heavy for laptop tests.
+- Added `merge/tests/test_data_unlabeled.py`: 9 CPU-runnable tests
+  for `UNLABELED_DATASETS` constants (count, indices, canonical name
+  agreement, required fields, sanity bounds, frozen-dataclass), the
+  `assert_cache_exists` error path (must list every missing repo and
+  point at the fetch script), and the happy path (after creating the
+  4 HF-convention subdirs).
+
+### Decisions and rationale
+
+- **Forward *post*-hook, not pre-hook with weight mutation.** The
+  natural Approach (B) — mutate `self.weight.data` before forward,
+  restore after via a paired hook — silently breaks AdaMerging.
+  `Parameter.data = X` is the no-grad assignment path; gradients
+  would not flow back to the AdaMerging coefficients. We instead use
+  Approach (A) in its cleanest form: a `register_forward_hook`
+  (post-hook) that returns `output + F.linear(input, delta,
+  bias=None)`. The base forward runs normally (frozen weights, no
+  recomputation needed); the *delta contribution* is a fresh
+  differentiable tensor op routed through `merged[canonical]`, which
+  is itself a function of `coefficients`. Autograd works as
+  designed.
+- **Pre-download script, not lazy `datasets.load_dataset` inside the
+  iterator.** Cluster pods are preemptible. A killed download leaves
+  a partial cache that the datasets library may or may not detect;
+  surfacing that failure inside a training run is hard to debug.
+  Pre-download is explicit, retriable, and prints per-dataset sizes
+  so anomalies (e.g. XSTest's filter unexpectedly dropping to zero)
+  surface immediately.
+- **Heuristic cache check, not online verification.** `assert_cache_
+  exists()` only verifies a top-level dir per dataset under
+  `<cache>/datasets/<repo>___`. A full integrity check would re-load
+  each dataset, which is slow and overlaps with what
+  `make_unlabeled_iter()` already does. The heuristic catches the
+  common failure mode (wrong `HF_HOME`, wiped cache) without false-
+  negative-ing on minor layout drift.
+- **MGSM `test` split, not `train`.** MGSM has no train split per
+  language. We use `en/test` minus any overlap with the milestone
+  validation set. Cycling is fine (the set is small; AdaMerging
+  trains on entropy, not memorized labels).
+- **XSTest filtered to `safe_*` types.** Pure entropy on harmful
+  prompts would push the model toward confident harmful outputs —
+  the wrong direction. Restricting to benign-but-superficially-
+  harmful (the over-refusal test set) aligns the objective with what
+  safety training should do.
+- **Batch size 2 default, max length 512.** Conservative for an
+  A100-40g (≈3.4 GB base + activations + 4 adapters ≈ 15 GB peak,
+  with comfortable headroom for stash-and-restore activations during
+  hook execution).
+- **Qwen3-1.7B GQA shapes hard-coded in the smoke fixture.** Real
+  Qwen3-1.7B uses Grouped-Query Attention: k_proj and v_proj output
+  `n_kv_heads × head_dim = 1024`, not `hidden = 2048`. Earlier draft
+  of `make_random_qwen3_adapter()` had square attn projections and
+  would have produced shape-mismatched ΔW vs. the live model. Fixed
+  before write. Constants are kept module-level (`QWEN3_1_7B_*`) so
+  a Qwen3-1.7B minor revision is a one-line review.
+- **Coefficient init = `1 / √r` for random adapters.** This makes the
+  smoke-script ΔWs roughly unit-magnitude per coordinate, so
+  AdaMerging coefficients move enough to validate the gradient path
+  in 50 steps. Real adapters arrive with their own scale; we do not
+  re-init on top.
+
+### Verified (laptop)
+
+- `pytest merge/tests/ -v`: 34 passed, 97 skipped (was 25 / 97 in
+  Stage 5a + 9 new CPU tests in `test_data_unlabeled.py`). All new
+  tests run without `datasets` or `torch` installed — the cache
+  check works against `pathlib`-only paths, and the dataset config
+  is plain dataclasses.
+- `git status`: only the allowed files modified (no commit, no push).
+
+### Verified (cluster)
+
+- TBD — pending `git pull && pip install datasets transformers &&
+  python scripts/fetch_adamerging_data.py && python
+  scripts/smoke_adamerging.py --max-steps 20` on RCP. Expected:
+  4 datasets fetched, smoke script exits 0 in ~5-10 min, AdaMerging
+  loss curve appears in the log and shows non-trivial decrease across
+  the 20 steps.
+
+### Open questions
+
+- Real teammate adapters still not pushed. Stage 5b's smoke uses
+  random-init; production AdaMerging will run on the 4 real adapters
+  when they land.
+- Smoke runs 50 steps by default; production target is 1000. May need
+  to tune `lr` (currently 1e-2) and `early_stop_patience` (currently
+  100) based on what the smoke loss curve looks like.
+- `infer.py` (Stage 5c) and `eval_all.py` (Stage 5c) still pending.
+  These unblock the bake-off comparison.
+- `publish.py` (Stage 5d) still pending. Required for the May 24
+  milestone push.
+
+---
+
 ## Open questions, blockers, decisions to revisit
 
 Running bulleted list. Items may be marked **resolved** but are never

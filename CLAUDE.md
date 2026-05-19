@@ -75,6 +75,9 @@ entirely.
   PEFT-format merged adapter, ready for `load()` round-trip.
 - **Dependencies**: Python dependencies for the merge subdir are listed in
   `requirements.txt` at the repo root.
+- **Runnable scripts** live in `scripts/` at the repo root:
+  `fetch_adamerging_data.py` (one-shot HF dataset pre-download),
+  `smoke_adamerging.py` (cluster smoke for the AdaMerging pipeline).
 
 ## Files to NEVER touch from a coding task
 

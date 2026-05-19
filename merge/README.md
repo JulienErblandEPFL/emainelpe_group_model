@@ -125,9 +125,44 @@ Update this table as stages land. Single source of truth.
 | `methods/adamerging.py` | `adamerging` (+ `AdaMergingResult`) | 5a | **done** |
 | `methods/__init__.py` | `dare_adamerging` (composition) | 5a | **done** |
 | `tests/test_adamerging.py` | layer-wise AdaMerging on toy fixtures | 5a | **done** |
-| `infer.py` | `generate_completions`, `generate_for_validation_set` | 5 | skeleton |
-| `publish.py` | `publish_adapter` | 5 | skeleton |
-| `eval_all.py` | `evaluate_completions`, `four_domain_average` | 5 | skeleton |
+| `data/unlabeled.py` | `UNLABELED_DATASETS`, `assert_cache_exists`, `make_unlabeled_iter` | 5b | **done** |
+| `qwen3_forward.py` | `make_qwen3_forward` (post-hook ΔW patching) | 5b | **done** |
+| `tests/fixtures/qwen3_adapter.py` | `make_random_qwen3_adapter` (cluster-only) | 5b | **done** |
+| `tests/test_data_unlabeled.py` | CPU unit tests for dataset config + cache check | 5b | **done** |
+| `../scripts/fetch_adamerging_data.py` | pre-download the 4 unlabeled datasets | 5b | **done** |
+| `../scripts/smoke_adamerging.py` | cluster smoke: random Qwen3 adapters → dare_adamerging | 5b | **done** |
+| `infer.py` | `generate_completions`, `generate_for_validation_set` | 5c | skeleton |
+| `publish.py` | `publish_adapter` | 5d | skeleton |
+| `eval_all.py` | `evaluate_completions`, `four_domain_average` | 5c | skeleton |
+
+## Stage 5b: Real-Qwen3 plumbing for AdaMerging
+
+The AdaMerging core (Stage 5a, `methods/adamerging.py`) is base-model-agnostic
+— it takes a caller-supplied `forward_fn` and `data_iter`. Stage 5b builds
+those callables for the real Qwen3-1.7B base model and real in-domain
+unlabeled prompts.
+
+- **`merge/data/unlabeled.py`** — 4 unlabeled in-domain datasets
+  (GSM8K, MMLU `auxiliary_train`, MGSM `en`, XSTest `safe_*`) wrapped in
+  a round-robin `(domain_idx, batch)` iterator. Tokenizes via the Qwen3
+  chat template with `add_generation_prompt=True`.
+- **`merge/qwen3_forward.py`** — loads Qwen3-1.7B once, registers a
+  forward post-hook on each LoRA-targetable Linear that adds
+  `F.linear(input, merged[canonical], bias=None)` to the layer's output.
+  Differentiable w.r.t. the AdaMerging coefficients without mutating
+  base-model weights.
+- **`scripts/fetch_adamerging_data.py`** — runnable pre-download. Run once
+  per environment before training.
+- **`scripts/smoke_adamerging.py`** — runnable cluster smoke: generates
+  4 random-init Qwen3-sized LoRA adapters and pushes them through
+  `dare_adamerging` for ~50 steps.
+
+Cluster workflow:
+
+```bash
+python scripts/fetch_adamerging_data.py
+python scripts/smoke_adamerging.py --max-steps 50
+```
 
 ## Out of scope for `merge/`
 
