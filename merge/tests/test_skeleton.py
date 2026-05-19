@@ -6,7 +6,7 @@ What this file guarantees:
    missing on the laptop).
 2. Each module's primary function raises ``NotImplementedError`` with the
    correct stage tag — i.e. nobody snuck real logic into Stage 1.
-3. ``METHOD_REGISTRY`` exposes all five user-facing method names.
+3. ``METHOD_REGISTRY`` exposes all six user-facing method names.
 4. ``lora.yaml`` still carries the team-locked values, including the new
    explicit ``modules_to_save: null`` line.
 
@@ -63,19 +63,14 @@ def test_eval_all_stubs_raise_stage_5() -> None:
 # Torch-dependent modules (skip if torch is missing)
 # ---------------------------------------------------------------------------
 
-def test_adamerging_stub_raises_stage_7() -> None:
-    pytest.importorskip("torch")
-    from merge.methods.adamerging import adamerging
-
-    with pytest.raises(NotImplementedError, match="Stage 7"):
-        adamerging([], "Qwen/Qwen3-1.7B", [], Path("dummy"))
-
-
-def test_method_registry_has_all_five_methods() -> None:
+def test_method_registry_has_all_six_methods() -> None:
     pytest.importorskip("torch")
     from merge.methods import METHOD_REGISTRY
 
-    expected = {"uniform", "dare_uniform", "dare_weighted", "ties", "adamerging"}
+    expected = {
+        "uniform", "dare_uniform", "dare_weighted",
+        "ties", "adamerging", "dare_adamerging",
+    }
     assert set(METHOD_REGISTRY.keys()) == expected, (
         f"METHOD_REGISTRY keys {set(METHOD_REGISTRY.keys())!r} "
         f"do not match expected {expected!r}"

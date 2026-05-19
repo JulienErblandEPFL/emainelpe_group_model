@@ -67,7 +67,7 @@ verify_spec  →  load_adapter  →  methods.<method>  →  pipeline.save  →  
 ## Method registry
 
 `merge/methods/__init__.py` exposes a single `METHOD_REGISTRY: dict[str, callable]`.
-The five user-facing methods, with implementation stage:
+The six user-facing methods, with implementation stage:
 
 | Method name | Implementation | Stage |
 |---|---|---|
@@ -75,7 +75,13 @@ The five user-facing methods, with implementation stage:
 | `dare_uniform` | `methods.__init__.dare_uniform` (composes `dare` + `uniform_merge`) | Stage 3 |
 | `dare_weighted` | `methods.__init__.dare_weighted` (composes `dare` + `weighted_linear_merge`) | Stage 3 |
 | `ties` | `methods.ties.ties_merge` | Stage 4 |
-| `adamerging` | `methods.adamerging.adamerging` | **Stage 7 (post-milestone)** |
+| `adamerging` | `methods.adamerging.adamerging` | Stage 5a |
+| `dare_adamerging` | `methods.__init__.dare_adamerging` (composes `dare` + `adamerging`) | Stage 5a |
+
+> `adamerging` and `dare_adamerging` require a `forward_fn` callable and a
+> `data_iter` iterable in `method_kwargs`. See `merge/methods/adamerging.py`
+> for the contract. Stage 5b will build the real-Qwen3 helpers (PEFT-hook
+> forward + unlabeled-data sampler).
 
 ## How to run the synthetic end-to-end test
 
@@ -109,10 +115,12 @@ Update this table as stages land. Single source of truth.
 | `methods/ties.py` | `ties_merge` | 4 | **done** |
 | `pipeline.py` | `merge_adapters`, `svd_factor` | 4 | **done** |
 | `tests/test_pipeline_synthetic.py` | end-to-end CPU test | 4 | **done** |
+| `methods/adamerging.py` | `adamerging` (+ `AdaMergingResult`) | 5a | **done** |
+| `methods/__init__.py` | `dare_adamerging` (composition) | 5a | **done** |
+| `tests/test_adamerging.py` | layer-wise AdaMerging on toy fixtures | 5a | **done** |
 | `infer.py` | `generate_completions`, `generate_for_validation_set` | 5 | skeleton |
 | `publish.py` | `publish_adapter` | 5 | skeleton |
 | `eval_all.py` | `evaluate_completions`, `four_domain_average` | 5 | skeleton |
-| `methods/adamerging.py` | `adamerging` | 7 (post-milestone) | skeleton |
 
 ## Out of scope for `merge/`
 

@@ -2,22 +2,30 @@
 Method registry for adapter merging.
 
 Maps method-name strings (used by ``merge.pipeline.merge_adapters``'s
-``method`` parameter) to callables. Five user-facing methods:
+``method`` parameter) to callables. Six user-facing methods:
 
 - ``"uniform"``           -> uniform_merge
 - ``"dare_uniform"``      -> DARE(each) then uniform_merge
 - ``"dare_weighted"``     -> DARE(each) then weighted_linear_merge
 - ``"ties"``              -> ties_merge                  (Stage 4)
-- ``"adamerging"``        -> adamerging                  (post-milestone, Stage 7)
+- ``"adamerging"``        -> adamerging                  (Stage 5a)
+- ``"dare_adamerging"``   -> DARE(each) then adamerging  (Stage 5a)
 
-The two ``dare_*`` entries are composition wrappers defined in this module;
-the others re-export the per-module implementations.
+The three ``dare_*`` entries are composition wrappers defined in this
+module; the others re-export the per-module implementations.
 
-Stage 3 implementation: ``uniform``, ``dare_uniform``, ``dare_weighted``
-are now real. ``ties`` and ``adamerging`` remain stubs.
+Note: ``adamerging`` and ``dare_adamerging`` have a richer call signature
+than the other methods. ``uniform``, ``dare_uniform``, ``dare_weighted``,
+and ``ties`` take ``(task_vectors, **method_kwargs)``. AdaMerging variants
+additionally require ``forward_fn`` and ``data_iter``, which must be
+supplied via ``method_kwargs`` when calling
+``pipeline.merge_adapters(method="dare_adamerging", method_kwargs={...})``.
+
+Stage 5a implementation.
 """
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 import torch
@@ -27,6 +35,9 @@ from .dare import dare
 from .ties import ties_merge
 from .uniform import uniform_merge
 from .weighted_linear import weighted_linear_merge
+
+
+logger = logging.getLogger(__name__)
 
 
 def dare_uniform(
@@ -88,10 +99,90 @@ def dare_weighted(
     return weighted_linear_merge(masked, weights)
 
 
+def dare_adamerging(
+    task_vectors: list[dict[str, torch.Tensor]],
+    forward_fn,
+    data_iter,
+    *,
+    drop_rate: float = 0.5,
+    seed: int | None = None,
+    rescale: bool = True,
+    init_coefficient: float = 0.3,
+    lr: float = 1e-2,
+    lambda_l2: float = 1e-4,
+    max_steps: int = 1000,
+    early_stop_patience: int = 100,
+    progress_log_every: int = 50,
+) -> dict[str, torch.Tensor]:
+    """Compose DARE + AdaMerging.
+
+    DARE is applied **once** to each input task vector before the
+    AdaMerging optimizer starts (Option α in the Day 4 decision log).
+    Re-DAREing every step would produce a stochastic objective even for
+    fixed coefficients, which complicates convergence; doing it once
+    gives a deterministic loss surface for entropy minimization.
+
+    Per-task seed = ``seed + i`` matches the pattern in :func:`dare_uniform`
+    and :func:`dare_weighted`.
+
+    Args:
+        task_vectors: List of N task-vector dicts.
+        forward_fn: Same callable contract as :func:`adamerging`.
+        data_iter: Same iterable contract as :func:`adamerging`.
+        drop_rate: DARE drop rate.
+        seed: Optional global seed; per-tv seed is ``seed + i``.
+        rescale: Whether DARE rescales survivors.
+        init_coefficient, lr, lambda_l2, max_steps, early_stop_patience,
+            progress_log_every: Forwarded to :func:`adamerging`.
+
+    Returns:
+        Merged task vector dict (unwrapped from
+        :class:`~merge.methods.adamerging.AdaMergingResult` for
+        consistency with the other methods in ``METHOD_REGISTRY``).
+    """
+    dared = [
+        dare(tv, drop_rate, seed=(None if seed is None else seed + i), rescale=rescale)
+        for i, tv in enumerate(task_vectors)
+    ]
+
+    result = adamerging(
+        dared,
+        forward_fn=forward_fn,
+        data_iter=data_iter,
+        init_coefficient=init_coefficient,
+        lr=lr,
+        lambda_l2=lambda_l2,
+        max_steps=max_steps,
+        early_stop_patience=early_stop_patience,
+        progress_log_every=progress_log_every,
+    )
+
+    final_loss = result.loss_history[-1] if result.loss_history else float("nan")
+    logger.info(
+        "dare_adamerging finished: %d steps, early_stopped=%s, final_loss=%.4f",
+        result.steps_run, result.early_stopped, final_loss,
+    )
+    return result.merged
+
+
+def _adamerging_dict(*args, **kwargs) -> dict[str, torch.Tensor]:
+    """Registry-facing thin wrapper around :func:`adamerging`.
+
+    The native :func:`adamerging` returns :class:`AdaMergingResult` (so
+    direct callers can inspect coefficients and loss history). The
+    pipeline orchestrator iterates ``merged.items()``, so the registry
+    entry must yield a dict. This wrapper extracts ``.merged`` and
+    forwards every argument verbatim.
+    """
+    result = adamerging(*args, **kwargs)
+    return result.merged
+
+
 METHOD_REGISTRY: dict[str, Callable[..., dict[str, torch.Tensor]]] = {
     "uniform": uniform_merge,
     "dare_uniform": dare_uniform,
     "dare_weighted": dare_weighted,
     "ties": ties_merge,
-    "adamerging": adamerging,
+    "adamerging": _adamerging_dict,
+    "dare_adamerging": dare_adamerging,
 }

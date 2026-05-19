@@ -282,6 +282,101 @@ for the final 4-page report.
 
 ---
 
+## Day 4 — 2026-05-18 — Stage 5a: AdaMerging core
+
+### What happened
+
+- Implemented `methods/adamerging.py`: layer-wise per-task coefficient
+  learning with entropy-min loss + L2 regularization. Coefficients are
+  fp32 of shape `[N_tasks, N_layers]`; the merge math computes
+  `sum_i coefficient[i, layer_of_k] * task_vector_i[k]` per parameter,
+  where the layer index is extracted from the canonical name
+  `model.layers.<N>.…`. Returns an `AdaMergingResult` dataclass exposing
+  the merged dict, final coefficients, full loss history, step count,
+  and early-stop flag.
+- Added `dare_adamerging` composition: DARE applied **once** per task
+  before training (Option α from the design discussion), with per-task
+  seed `= seed + i` matching `dare_uniform` / `dare_weighted`. Returns
+  the merged dict only, so it slots into `METHOD_REGISTRY`'s callable
+  contract.
+- AdaMerging is registry-callable via a thin `_adamerging_dict` shim
+  that unwraps `AdaMergingResult.merged`. Direct callers (tests, future
+  hyperparameter sweeps) keep the full result; pipeline dispatch sees
+  a dict, identical to all other methods. Registry grows from 5 to 6.
+- Synthetic forward + data fixtures (`fixtures/adamerging_helpers.py`)
+  give the training loop a differentiable path on CPU without a real
+  model: two stacked linear layers + tanh + unembed, perturbed by the
+  merged q_proj entries. ~50 LoC. Stage 5b will plug in a real Qwen3
+  forward via PEFT hooks.
+
+### Decisions and rationale
+
+- **Layer-wise granularity.** Paper default; one scalar per (task, layer).
+  For Qwen3-1.7B (28 layers × 4 tasks) that's 112 learnable scalars; for
+  toy adapters (2 × 4) it's 8. All target_modules within a layer share
+  the coefficient — sufficient resolution without over-parameterizing.
+- **Init = 0.3, lr = 1e-2, Adam.** Paper defaults. Slight under-weighting
+  from uniform encourages a non-degenerate solution; high lr is fine
+  because we're tuning ~100 scalars, not millions of weights.
+- **Pure entropy + L2 (1e-4).** Entropy alone can let coefficients drift
+  to extremes that overfit the unlabeled distribution; 1e-4 L2 keeps
+  them bounded without dominating signal.
+- **Early stop with patience=100, improvement threshold 1e-6.** Detects
+  flat loss without false-positives from fp32 noise.
+- **DARE once before AdaMerging, not per step.** Re-DAREing every step
+  produces a stochastic objective even for fixed coefficients (different
+  masks → different merge → different loss), which complicates
+  convergence diagnostics. Deterministic loss surface is cleaner.
+- **`forward_fn` and `data_iter` are caller-supplied.** Decouples the
+  merge math from base-model framework. Tests use a synthetic forward;
+  Stage 5b will provide a real-Qwen3 forward via PEFT hooks.
+- **Bookkeeping fix vs spec.** The spec used `for...else` to set
+  `early_stopped=False`, but Python's `for...else` only runs when the
+  loop terminates *without* break — and we always break at
+  `step >= max_steps`. Replaced with explicit `early_stopped = False`
+  init + `steps_run = step + 1` updates per training step. Now correct
+  on all three exit paths (max_steps, plateau, iterator exhaustion).
+- **Registry-shim for `adamerging`.** Spec said
+  `METHOD_REGISTRY["adamerging"] = adamerging` directly, but
+  `adamerging()` returns `AdaMergingResult` while the pipeline
+  iterates `merged.items()`. Wrapping via `_adamerging_dict` keeps all
+  six registry callables dict-returning so any pipeline dispatch path
+  works uniformly.
+- **Unlabeled data plan for Stage 5b real runs:**
+  - Math: GSM8K train split (first 1k examples)
+  - Knowledge: MMLU train split (first 1k examples)
+  - Multilingual: MGSM train split (first 1k examples)
+  - Safety: XSTest benign prompts (~250 examples, cycled if needed)
+
+### Verified (laptop)
+
+- 12 new AdaMerging tests added; all torch-gated via `importorskip` so
+  they skip cleanly on the laptop. Existing 25 torch-free tests still
+  pass.
+- Skeleton test renamed to `test_method_registry_has_all_six_methods`;
+  obsolete `test_adamerging_stub_raises_stage_7` removed.
+
+### Verified (cluster)
+
+- TBD — pending next `git pull && pytest merge/tests/ -v` on RCP.
+  Expected: ~120 tests pass (was 108; +12 new AdaMerging tests; -1
+  removed stub test; +1 net renamed registry test). Synthetic forward
+  must produce decreasing loss over 100 steps and coefficient
+  divergence > 0.01 from the 0.3 init.
+
+### Open questions
+
+- Real-Qwen3 convergence on actual unlabeled data is the Stage 5b
+  cluster smoke test.
+- AdaMerging memory cost on Qwen3-1.7B not yet measured (budget
+  estimate: ~7 GB base + ~2 GB activations + ~545 MB × 4 adapters ≈
+  15 GB total, well within A100-40GB).
+- Should AdaMerging coefficients be initialized from `dare_uniform`'s
+  output (i.e., 1/N) instead of 0.3? Paper picks 0.3; revisit if real
+  convergence is slow.
+
+---
+
 ## Open questions, blockers, decisions to revisit
 
 Running bulleted list. Items may be marked **resolved** but are never
