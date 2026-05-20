@@ -30,3 +30,12 @@ transformers>=4.40
 # Stage 5c.1 addition (vLLM-based eval). Lazy-imported by `merge/infer.py`
 # and `merge/eval_all.py` — torch-free laptops do not need it for tests.
 vllm>=0.6.0
+
+# Day 7 (2026-05-20) addition.
+# bitsandbytes pinned >=0.44 because the cluster docker image ships 0.42
+# (CUDA 11.x only). PEFT imports bnb unconditionally when setting up LoRA
+# Linear layers; old bnb crashes on CUDA 12.x. Upgrading bnb on a fresh pod:
+#     pip install -U bitsandbytes
+# Or rely on this requirements.txt entry:
+#     pip install -r requirements.txt
+bitsandbytes>=0.44.0

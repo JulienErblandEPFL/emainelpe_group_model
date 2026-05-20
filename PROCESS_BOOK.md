@@ -880,3 +880,102 @@ via `peft.merge_and_unload()` instead of a LoRA-only output. Drop
   prompt). Its post-merge assertions will need updating to the
   full-model layout before the next smoke run; flagged here as
   follow-up.
+
+
+## Day 7 follow-up — 2026-05-20 — bitsandbytes pin + GPU cleanup on exception
+
+### What happened
+
+Cluster verification of the Day 7 full-model refactor surfaced two issues
+that compounded into 4 test failures and 3 spurious OOMs.
+
+1. **bitsandbytes 0.42 → CUDA 12 mismatch.** The cluster docker image
+   ships bitsandbytes 0.42 with pre-compiled `.so` files for CUDA 11.x
+   only; cluster runtime is CUDA 12.8. PEFT imports bnb unconditionally
+   when constructing LoRA Linear layers (peft/tuners/lora/model.py
+   imports `bnb` for the 8-bit quantization paths, even when we don't
+   use them). The bnb import path raised:
+
+   ```
+   RuntimeError: CUDA Setup failed despite GPU being available
+   ```
+
+   This broke `pipeline.merge_adapters` at `get_peft_model(base, ...)`,
+   which propagated to every full-pipeline test.
+
+2. **Failed merges pinned GPU memory.** When the first
+   `test_pipeline_uniform_produces_full_model` failed (from the bnb
+   import error), the already-loaded Qwen3-1.7B (~3.4 GB) stayed
+   allocated. The 3 subsequent pipeline tests OOM'd at increasingly
+   pathological sizes (192 MB tried / 170 MB free → 24 MB / 8 MB →
+   2 MB / 2 MB), turning one root failure into four.
+
+### Decisions and rationale
+
+- **Pin `bitsandbytes>=0.44.0` in `requirements.txt`.** Loose pin so
+  later updates don't fight the image; tight enough to skip the
+  CUDA-11-only 0.42 binaries. The cluster fix is `pip install -U
+  bitsandbytes` or `pip install -r requirements.txt` on a fresh pod.
+- **Wrap GPU-holding work in try/finally inside
+  `pipeline.merge_adapters`.** Releases base / peft_model /
+  merged_model / task_vectors / intermediate dicts in all exit paths,
+  not just on success. The pattern: initialize the GPU-holding names
+  to `None` before the try so unconditional `del` is safe; in finally
+  run `del → gc.collect() → torch.cuda.empty_cache()`. Log the
+  acquire/release events so a multi-merge run (e.g. the upcoming
+  bake-off) can be diagnosed from logs alone.
+- **Method-name validation moved inside the try block.** Was an
+  early-fail before `load_all`; that made the cleanup path untestable
+  via the natural "bad method name" trigger and gave the test
+  ambiguous coverage. Cost: a few seconds of wasted `load_all` work
+  on typo'd method names. Benefit: the cleanup test exercises the
+  GPU finally-block path with a simple `KeyError` trigger and lays
+  down a regression check for the exact failure mode we saw on
+  cluster (one bad merge cascading into multiple OOMs).
+
+### Implementation
+
+- `requirements.txt` — added `bitsandbytes>=0.44.0` with a comment
+  pointing at this entry and the `pip install -U` fallback.
+- `merge/pipeline.py` — refactored body of `merge_adapters` into a
+  try/finally. Initialized `base / peft_model / merged_model /
+  task_vectors / adapters_by_domain / factorized / state_update /
+  existing_state` to `None` before the try. Method-name validation
+  moved inside the try block (after `load_all`). Finally block runs
+  unconditional `del`s, `gc.collect()`, and `torch.cuda.empty_cache()`
+  with a release log line.
+- `merge/tests/test_pipeline.py` — added
+  `test_pipeline_releases_gpu_memory_on_exception`. Cluster-gated
+  (CUDA + transformers + peft). First call triggers a `KeyError` for
+  `method="unknown_method"`, then a 400 MB probe allocation must
+  succeed, then a second successful `uniform` merge must complete.
+- `CLAUDE.md` — added a bullet to the dependencies note explaining
+  the bnb pin requirement.
+
+### Verified (laptop)
+
+- `pytest merge/tests/ -v` runs to completion: same pass/skip pattern
+  as before the fix (laptop is torch-free; CUDA-gated tests skip).
+  The new cleanup test joins the cluster-only skip set.
+
+### Verified (cluster)
+
+- *To fill in after the next `runai submit`: confirm that with
+  bitsandbytes >=0.44 installed in the pod, all 4 previously-failing
+  pipeline integration tests pass; confirm
+  `test_pipeline_releases_gpu_memory_on_exception` passes (probe
+  succeeds and second merge completes); confirm no OOM cascade across
+  back-to-back pipeline tests.*
+
+### Open questions / follow-ups
+
+- Should the cluster docker image upgrade bnb itself, so future pods
+  don't need to `pip install -U` on first start? Owned by whoever
+  manages the team image; not blocking.
+- The wasted-`load_all`-on-typo cost from moving method validation
+  inside the try is ~10s on CPU bf16 / seconds on GPU. Acceptable
+  for the testability win, but if the bake-off ever runs typo'd
+  method names in a tight loop the early-fail variant could come back
+  via a cheap `if method not in METHOD_REGISTRY` guard before
+  `load_all` — without removing the in-try check that the test relies
+  on.

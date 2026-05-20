@@ -308,3 +308,48 @@ def test_pipeline_no_generation_config_when_omitted(
         # The custom override would have set temperature=0.3 (test above);
         # confirm we didn't accidentally write that here.
         assert loaded.get("temperature") != 0.3
+
+
+def test_pipeline_releases_gpu_memory_on_exception(
+    qwen3_random_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """A failed merge_adapters must not leave GPU memory pinned.
+
+    Regression test for the Day 7 follow-up: when the first call raises
+    (here: unknown method dispatched inside the try block, after load_all
+    has placed adapters on GPU), the next allocation and the next
+    successful merge must both succeed without OOM.
+
+    The method-name validation lives inside the try block precisely so
+    this failure mode exercises the finally-block cleanup.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+    if not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+
+    from merge.pipeline import merge_adapters
+
+    with pytest.raises(KeyError):
+        merge_adapters(
+            qwen3_random_adapters_dir,
+            method="unknown_method",
+            output_dir=tmp_path / "first",
+            locked_spec_path=lora_yaml_path,
+        )
+
+    try:
+        probe = torch.zeros(100_000_000, dtype=torch.float32, device="cuda")
+        del probe
+        torch.cuda.empty_cache()
+    except torch.cuda.OutOfMemoryError:
+        pytest.fail("GPU memory was not released after failed merge_adapters call")
+
+    merge_adapters(
+        qwen3_random_adapters_dir,
+        method="uniform",
+        output_dir=tmp_path / "second",
+        locked_spec_path=lora_yaml_path,
+    )
+    assert (tmp_path / "second" / "config.json").exists()

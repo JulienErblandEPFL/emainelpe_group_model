@@ -140,12 +140,6 @@ def merge_adapters(
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import LoraConfig, get_peft_model
 
-    if method not in METHOD_REGISTRY:
-        raise KeyError(
-            f"unknown merge method {method!r}; "
-            f"valid options are {sorted(METHOD_REGISTRY.keys())!r}"
-        )
-
     spec_path = locked_spec_path if locked_spec_path is not None else DEFAULT_LOCKED_SPEC
     locked_spec = load_locked_spec(spec_path)
     r = int(locked_spec["r"])
@@ -157,120 +151,153 @@ def merge_adapters(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("merge_adapters using device=%s, base=%s", device, base_model_repo)
 
-    adapters_by_domain = load_all(adapters_dir, locked_spec, device=device)
-    task_vectors = list(adapters_by_domain.values())
-    logger.info(
-        "Loaded %d adapters for merge (domains=%s, method=%s)",
-        len(task_vectors), list(adapters_by_domain.keys()), method,
-    )
+    # GPU-holding references initialized to None so the finally-block ``del``s
+    # are always safe — even if an exception fires before the try block's body
+    # has assigned them.
+    base = None
+    peft_model = None
+    merged_model = None
+    adapters_by_domain: dict[str, Any] | None = None
+    task_vectors: list[Any] | None = None
+    factorized: dict[str, tuple[Any, Any]] | None = None
+    state_update: dict[str, Any] | None = None
+    existing_state: dict[str, Any] | None = None
 
-    kwargs = method_kwargs or {}
-    merge_fn = METHOD_REGISTRY[method]
-    merged = merge_fn(task_vectors, **kwargs)
+    try:
+        logger.info("Acquiring GPU memory for merge_adapters")
 
-    factorized: dict[str, tuple[Any, Any]] = {}
-    for canonical, delta_w in merged.items():
-        lora_a, lora_b = svd_factor(delta_w, r=r, alpha=alpha)
-        factorized[canonical] = (lora_a, lora_b)
-    logger.info("SVD-factored %d merged ΔW tensors to rank-%d", len(factorized), r)
+        adapters_by_domain = load_all(adapters_dir, locked_spec, device=device)
+        task_vectors = list(adapters_by_domain.values())
+        logger.info(
+            "Loaded %d adapters for merge (domains=%s, method=%s)",
+            len(task_vectors), list(adapters_by_domain.keys()), method,
+        )
 
-    logger.info("Loading base model %s onto %s", base_model_repo, device)
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model_repo,
-        torch_dtype=torch.bfloat16,
-        device_map=device,
-    )
-
-    lora_config = LoraConfig(
-        r=int(locked_spec["r"]),
-        lora_alpha=int(locked_spec["lora_alpha"]),
-        lora_dropout=float(locked_spec["lora_dropout"]),
-        target_modules=list(locked_spec["target_modules"]),
-        bias=locked_spec["bias"],
-        task_type=locked_spec["task_type"],
-    )
-    logger.info("Wrapping base model with PEFT LoraConfig (r=%d, alpha=%d)", r, alpha)
-    peft_model = get_peft_model(base, lora_config)
-
-    # Translate canonical names to the PEFT-format keys present in
-    # peft_model.state_dict(). decanonicalize() builds the same
-    # 'base_model.model.<canonical>.lora_{A,B}.default.weight' format that
-    # load_adapter.canonicalize() inverts.
-    state_update: dict[str, Any] = {}
-    existing_state = peft_model.state_dict()
-    for canonical, (lora_a, lora_b) in factorized.items():
-        a_key = decanonicalize(canonical, "lora_A")
-        b_key = decanonicalize(canonical, "lora_B")
-        if a_key not in existing_state or b_key not in existing_state:
+        # Method-name validation moved inside the try block so a typo on a
+        # bad method name still goes through the GPU-memory finally cleanup
+        # if load_all already placed task vectors on cuda. Wasted load_all
+        # work on typos is seconds-scale; the alternative (early-fail before
+        # acquiring GPU) makes the cleanup path harder to test.
+        if method not in METHOD_REGISTRY:
             raise KeyError(
-                f"PEFT wrapper has no parameter named {a_key!r} or {b_key!r}; "
-                f"check that LoraConfig target_modules match the base model "
-                f"architecture (got target_modules={locked_spec['target_modules']!r})"
+                f"unknown merge method {method!r}; "
+                f"valid options are {sorted(METHOD_REGISTRY.keys())!r}"
             )
-        ref_a = existing_state[a_key]
-        ref_b = existing_state[b_key]
-        state_update[a_key] = lora_a.to(device=ref_a.device, dtype=ref_a.dtype)
-        state_update[b_key] = lora_b.to(device=ref_b.device, dtype=ref_b.dtype)
 
-    missing, unexpected = peft_model.load_state_dict(state_update, strict=False)
-    if unexpected:
-        logger.warning(
-            "load_state_dict reported %d unexpected keys: %s",
-            len(unexpected), unexpected[:5],
-        )
-    logger.info(
-        "Injected %d LoRA tensors into PEFT wrapper (%d base params untouched)",
-        len(state_update), len(missing),
-    )
+        kwargs = method_kwargs or {}
+        merge_fn = METHOD_REGISTRY[method]
+        merged = merge_fn(task_vectors, **kwargs)
 
-    sample_key = next(iter(state_update.keys()))
-    after = peft_model.state_dict()[sample_key]
-    if not torch.allclose(
-        after.detach().to(state_update[sample_key].device, state_update[sample_key].dtype),
-        state_update[sample_key],
-        rtol=1e-3,
-        atol=1e-3,
-    ):
-        raise RuntimeError(
-            f"PEFT injection check failed: load_state_dict did not write {sample_key}. "
-            "Check PEFT version compatibility (expected base_model.model.* key prefix)."
+        factorized = {}
+        for canonical, delta_w in merged.items():
+            lora_a, lora_b = svd_factor(delta_w, r=r, alpha=alpha)
+            factorized[canonical] = (lora_a, lora_b)
+        logger.info("SVD-factored %d merged ΔW tensors to rank-%d", len(factorized), r)
+
+        logger.info("Loading base model %s onto %s", base_model_repo, device)
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model_repo,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
         )
 
-    logger.info("Running merge_and_unload to bake deltas into base weights")
-    merged_model = peft_model.merge_and_unload()
+        lora_config = LoraConfig(
+            r=int(locked_spec["r"]),
+            lora_alpha=int(locked_spec["lora_alpha"]),
+            lora_dropout=float(locked_spec["lora_dropout"]),
+            target_modules=list(locked_spec["target_modules"]),
+            bias=locked_spec["bias"],
+            task_type=locked_spec["task_type"],
+        )
+        logger.info("Wrapping base model with PEFT LoraConfig (r=%d, alpha=%d)", r, alpha)
+        peft_model = get_peft_model(base, lora_config)
 
-    logger.info("Saving full merged model to %s", output_dir)
-    merged_model.save_pretrained(
-        output_dir,
-        safe_serialization=True,
-        max_shard_size="5GB",
-    )
+        state_update = {}
+        existing_state = peft_model.state_dict()
+        for canonical, (lora_a, lora_b) in factorized.items():
+            a_key = decanonicalize(canonical, "lora_A")
+            b_key = decanonicalize(canonical, "lora_B")
+            if a_key not in existing_state or b_key not in existing_state:
+                raise KeyError(
+                    f"PEFT wrapper has no parameter named {a_key!r} or {b_key!r}; "
+                    f"check that LoraConfig target_modules match the base model "
+                    f"architecture (got target_modules={locked_spec['target_modules']!r})"
+                )
+            ref_a = existing_state[a_key]
+            ref_b = existing_state[b_key]
+            state_update[a_key] = lora_a.to(device=ref_a.device, dtype=ref_a.dtype)
+            state_update[b_key] = lora_b.to(device=ref_b.device, dtype=ref_b.dtype)
 
-    logger.info("Saving tokenizer from %s", base_model_repo)
-    tokenizer = AutoTokenizer.from_pretrained(base_model_repo)
-    tokenizer.save_pretrained(output_dir)
-
-    chat_template_src = DEFAULT_CHAT_TEMPLATE
-    if chat_template_src.exists():
-        shutil.copy2(chat_template_src, output_dir / "chat_template.jinja")
-        logger.info("Copied locked chat_template.jinja to %s", output_dir)
-    else:
-        logger.warning(
-            "Locked chat template not found at %s; merged model will use the "
-            "tokenizer's bundled template.",
-            chat_template_src,
+        missing, unexpected = peft_model.load_state_dict(state_update, strict=False)
+        if unexpected:
+            logger.warning(
+                "load_state_dict reported %d unexpected keys: %s",
+                len(unexpected), unexpected[:5],
+            )
+        logger.info(
+            "Injected %d LoRA tensors into PEFT wrapper (%d base params untouched)",
+            len(state_update), len(missing),
         )
 
-    if generation_config is not None:
-        gen_path = output_dir / "generation_config.json"
-        with gen_path.open("w") as f:
-            json.dump(generation_config, f, indent=2)
-        logger.info("Wrote generation_config.json to %s", gen_path)
+        sample_key = next(iter(state_update.keys()))
+        after = peft_model.state_dict()[sample_key]
+        if not torch.allclose(
+            after.detach().to(state_update[sample_key].device, state_update[sample_key].dtype),
+            state_update[sample_key],
+            rtol=1e-3,
+            atol=1e-3,
+        ):
+            raise RuntimeError(
+                f"PEFT injection check failed: load_state_dict did not write {sample_key}. "
+                "Check PEFT version compatibility (expected base_model.model.* key prefix)."
+            )
 
-    del peft_model, merged_model, base, state_update, existing_state, factorized
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        logger.info("Running merge_and_unload to bake deltas into base weights")
+        merged_model = peft_model.merge_and_unload()
+
+        logger.info("Saving full merged model to %s", output_dir)
+        merged_model.save_pretrained(
+            output_dir,
+            safe_serialization=True,
+            max_shard_size="5GB",
+        )
+
+        logger.info("Saving tokenizer from %s", base_model_repo)
+        tokenizer = AutoTokenizer.from_pretrained(base_model_repo)
+        tokenizer.save_pretrained(output_dir)
+
+        chat_template_src = DEFAULT_CHAT_TEMPLATE
+        if chat_template_src.exists():
+            shutil.copy2(chat_template_src, output_dir / "chat_template.jinja")
+            logger.info("Copied locked chat_template.jinja to %s", output_dir)
+        else:
+            logger.warning(
+                "Locked chat template not found at %s; merged model will use the "
+                "tokenizer's bundled template.",
+                chat_template_src,
+            )
+
+        if generation_config is not None:
+            gen_path = output_dir / "generation_config.json"
+            with gen_path.open("w") as f:
+                json.dump(generation_config, f, indent=2)
+            logger.info("Wrote generation_config.json to %s", gen_path)
+    finally:
+        # Drop every name that could be holding GPU tensors. The locals are
+        # all initialized to None before the try so unconditional del is safe.
+        del peft_model
+        del merged_model
+        del base
+        del state_update
+        del existing_state
+        del factorized
+        del task_vectors
+        del adapters_by_domain
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logger.info("Released GPU memory after merge_adapters")
 
     return output_dir
 

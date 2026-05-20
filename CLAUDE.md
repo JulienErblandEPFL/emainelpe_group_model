@@ -86,7 +86,11 @@ entirely.
   (`base_model.model.model.layers.X.mlp.down_proj.lora_A.default.weight`
   is `unsupported LoRA weight`). See Day 7 entry in PROCESS_BOOK.
 - **Dependencies**: Python dependencies for the merge subdir are listed in
-  `requirements.txt` at the repo root.
+  `requirements.txt` at the repo root. **bitsandbytes must be >=0.44 for
+  CUDA 12.x compatibility.** Pinned in `requirements.txt`. The cluster
+  docker image ships 0.42 which only supports CUDA 11.x; PEFT crashes on
+  import when bnb's CUDA setup fails. On a fresh pod, either
+  `pip install -U bitsandbytes` or `pip install -r requirements.txt`.
 - **Generation config**: structure is locked (token IDs from project
   description), values are tunable via
   `merge.generation_config.make_generation_config(...)`. Eval reads via
