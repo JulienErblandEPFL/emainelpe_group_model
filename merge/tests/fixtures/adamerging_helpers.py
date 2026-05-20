@@ -47,23 +47,42 @@ def make_synthetic_forward_fn(
     g = torch.Generator()
     g.manual_seed(seed)
 
-    embedding = torch.randn(vocab_size, hidden_dim, generator=g, dtype=torch.float32)
-    base_layer_weights = [
-        torch.randn(hidden_dim, hidden_dim, generator=g, dtype=torch.float32)
-        for _ in range(n_layers)
-    ]
-    unembed = torch.randn(vocab_size, hidden_dim, generator=g, dtype=torch.float32)
+    # State is built on CPU and lazily migrated to the device of the merged
+    # task vector on first call. Stage 5c.1.5 made merge_adapters auto-select
+    # cuda on cluster, so the merged dict can arrive on a different device
+    # than the fixture's CPU-initialized tensors.
+    state: dict[str, object] = {
+        "embedding": torch.randn(vocab_size, hidden_dim, generator=g, dtype=torch.float32),
+        "base_layer_weights": [
+            torch.randn(hidden_dim, hidden_dim, generator=g, dtype=torch.float32)
+            for _ in range(n_layers)
+        ],
+        "unembed": torch.randn(vocab_size, hidden_dim, generator=g, dtype=torch.float32),
+        "device": torch.device("cpu"),
+    }
 
     def forward_fn(merged: dict[str, torch.Tensor], batch: dict) -> torch.Tensor:
-        input_ids = batch["input_ids"]
-        hidden = embedding[input_ids]
+        # Detect the merged-tensor device and migrate the fixture's internal
+        # tensors once if it differs from where they currently live. After
+        # the first call on a given device, this branch is a no-op.
+        target_device = next(iter(merged.values())).device
+        if target_device != state["device"]:
+            state["embedding"] = state["embedding"].to(target_device)
+            state["base_layer_weights"] = [
+                w.to(target_device) for w in state["base_layer_weights"]
+            ]
+            state["unembed"] = state["unembed"].to(target_device)
+            state["device"] = target_device
+
+        input_ids = batch["input_ids"].to(target_device)
+        hidden = state["embedding"][input_ids]
         for layer_idx in range(n_layers):
             key = f"model.layers.{layer_idx}.self_attn.q_proj"
             layer_delta = merged[key].float()
-            effective_weight = base_layer_weights[layer_idx] + layer_delta
+            effective_weight = state["base_layer_weights"][layer_idx] + layer_delta
             hidden = torch.matmul(hidden, effective_weight.T)
             hidden = torch.tanh(hidden)
-        logits = torch.matmul(hidden, unembed.T)
+        logits = torch.matmul(hidden, state["unembed"].T)
         return logits
 
     return forward_fn
