@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--merged-adapter-dir",
         type=Path,
         required=True,
-        help="PEFT-format merged adapter directory (must contain adapter_config.json + adapter_model.safetensors).",
+        help="Full HF-format merged model directory (must contain config.json + model.safetensors or shard index).",
     )
     parser.add_argument(
         "--output-dir",
@@ -153,13 +153,16 @@ def validate_args(args: argparse.Namespace) -> list[str]:
     if not args.merged_adapter_dir.is_dir():
         errors.append(f"--merged-adapter-dir not a directory: {args.merged_adapter_dir}")
     else:
-        if not (args.merged_adapter_dir / "adapter_config.json").exists():
+        if not (args.merged_adapter_dir / "config.json").exists():
             errors.append(
-                f"adapter_config.json missing under {args.merged_adapter_dir}"
+                f"config.json missing under {args.merged_adapter_dir}"
             )
-        if not (args.merged_adapter_dir / "adapter_model.safetensors").exists():
+        has_single = (args.merged_adapter_dir / "model.safetensors").exists()
+        has_sharded = (args.merged_adapter_dir / "model.safetensors.index.json").exists()
+        if not (has_single or has_sharded):
             errors.append(
-                f"adapter_model.safetensors missing under {args.merged_adapter_dir}"
+                f"model.safetensors (or model.safetensors.index.json) missing "
+                f"under {args.merged_adapter_dir}"
             )
 
     if not args.validation_samples_dir.is_dir():

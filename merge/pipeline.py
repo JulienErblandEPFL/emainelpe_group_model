@@ -4,21 +4,29 @@ End-to-end orchestrator for the group-merge pipeline.
 Reads four locked-spec LoRA adapters from a local directory, verifies them
 against ``lora.yaml``, dispatches to the configured merge method through
 ``METHOD_REGISTRY``, SVD-truncates the merged ΔW back to the locked rank
-``r``, and writes a PEFT-readable adapter directory to disk.
+``r``, injects the rank-r factors into a fresh PEFT wrapper around the base
+model, runs ``merge_and_unload`` to bake the deltas into the base weights,
+and writes a full HF-format model directory to disk.
 
-The pipeline never pushes to HF (that is :mod:`merge.publish`'s job, Stage 5)
-and never loads the base model — only the LoRA factors.
+The output is a self-contained ``transformers``-loadable directory
+(``config.json`` + ``model.safetensors``) — not a LoRA adapter. The
+intermediate LoRA factorization is held in GPU memory and never hits
+disk; the rank-r truncation discipline is preserved (we still respect the
+locked-spec ``r`` and ``α``) but the artifact is the full materialized
+model. This format is what vLLM and the May 24 milestone CI both consume.
 
-Stage 4 implementation.
+Stage 4 implementation; refactored in Day 7 (2026-05-20) after the vLLM
+LoRA loader rejected PEFT-format adapter weights.
 """
 from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
-from .load_adapter import CANONICAL_DOMAINS, decanonicalize, load_all
+from .load_adapter import decanonicalize, load_all
 from .methods import METHOD_REGISTRY
 from .verify_spec import load_locked_spec
 
@@ -27,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 DEFAULT_LOCKED_SPEC: Path = REPO_ROOT / "lora.yaml"
+DEFAULT_CHAT_TEMPLATE: Path = REPO_ROOT / "chat_template.jinja"
 
 
 def svd_factor(
@@ -45,7 +54,6 @@ def svd_factor(
 
     dtype = delta_w.dtype
     delta_w_fp32 = delta_w.to(torch.float32)
-    # Thin SVD: U [out, k], S [k], Vh [k, in], with k = min(out, in).
     u, s, vh = torch.linalg.svd(delta_w_fp32, full_matrices=False)
 
     if r > s.numel():
@@ -79,19 +87,6 @@ def _ensure_empty_output_dir(output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=False)
 
 
-def _copy_adapter_config(
-    source_adapter_dir: Path,
-    output_dir: Path,
-) -> None:
-    """Copy ``adapter_config.json`` from ``source_adapter_dir``, set inference_mode=False."""
-    src = source_adapter_dir / "adapter_config.json"
-    with src.open() as f:
-        cfg = json.load(f)
-    cfg["inference_mode"] = False
-    with (output_dir / "adapter_config.json").open("w") as f:
-        json.dump(cfg, f, indent=2)
-
-
 def merge_adapters(
     adapters_dir: Path,
     method: str,
@@ -99,42 +94,36 @@ def merge_adapters(
     locked_spec_path: Path | None = None,
     method_kwargs: dict[str, Any] | None = None,
     generation_config: dict[str, Any] | None = None,
+    base_model_repo: str = "Qwen/Qwen3-1.7B",
     device: str | None = None,
 ) -> Path:
-    """Run the full merge pipeline and write a PEFT-loadable adapter directory.
+    """Run the full merge pipeline and write a full HF-format model directory.
 
-    Pipeline: load_all → verify each → dispatch to method → SVD factor → save.
+    Pipeline: load_all → verify each → dispatch to method → SVD factor →
+    inject into PEFT wrapper around base model → merge_and_unload →
+    save_pretrained (full model) → copy tokenizer + chat template.
 
     Args:
         adapters_dir: Directory with four subdirs (``math``, ``general_knowledge``,
             ``safety``, ``multilingual``), each a PEFT-format LoRA adapter.
-        method: One of ``METHOD_REGISTRY`` keys: ``"uniform"``,
-            ``"dare_uniform"``, ``"dare_weighted"``, ``"ties"``.
-            ``"adamerging"`` is still a stub (Stage 7).
-        output_dir: Directory to write the merged adapter to. Created if
+        method: One of ``METHOD_REGISTRY`` keys.
+        output_dir: Directory to write the merged model to. Created if
             missing. If it exists, must be empty; otherwise raises
             ``FileExistsError``.
         locked_spec_path: Path to ``lora.yaml``. Defaults to the repo root.
-        method_kwargs: Keyword arguments forwarded to the method (e.g.
-            ``{"drop_rate": 0.5, "seed": 42}`` for DARE variants;
-            ``{"weights": [...]}``  for ``dare_weighted``;
-            ``{"trim_ratio": 0.5}`` for TIES).
+        method_kwargs: Keyword arguments forwarded to the method.
         generation_config: If provided, written to
-            ``output_dir/generation_config.json`` as part of the merged
-            adapter directory. The dict structure should match the CS-552
-            project's required schema (use
-            :func:`merge.generation_config.make_generation_config` to
-            construct). If ``None``, no ``generation_config.json`` is
-            written.
+            ``output_dir/generation_config.json`` alongside the model.
+        base_model_repo: HF repo or local path for the base model. Defaults
+            to ``Qwen/Qwen3-1.7B``.
         device: Compute device for loading + merging. ``None`` (default)
             auto-selects ``"cuda"`` when ``torch.cuda.is_available()``,
-            otherwise ``"cpu"``. The final safetensors save always runs
-            from CPU tensors regardless of this choice.
+            otherwise ``"cpu"``.
 
     Returns:
-        The ``output_dir`` path (now populated with ``adapter_config.json``,
-        ``adapter_model.safetensors``, and optionally
-        ``generation_config.json``).
+        The ``output_dir`` path (now populated with ``config.json``,
+        ``model.safetensors`` (or sharded variants), tokenizer files,
+        ``chat_template.jinja``, and optionally ``generation_config.json``).
 
     Raises:
         FileNotFoundError: if ``adapters_dir`` or its expected subdirs are
@@ -145,11 +134,11 @@ def merge_adapters(
         NotImplementedError: if ``method`` is still a stub.
         ValueError: if method kwargs are invalid for the chosen method.
     """
-    # Lazy: safetensors is only needed at the save step. Importing it at
-    # module level would force the laptop's torch-free environment to fail
-    # at import time, defeating the lazy-import pattern from Stage 2.
+    import gc
+
     import torch
-    from safetensors.torch import save_file as safetensors_save_file
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import LoraConfig, get_peft_model
 
     if method not in METHOD_REGISTRY:
         raise KeyError(
@@ -166,11 +155,10 @@ def merge_adapters(
 
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info("merge_adapters using device=%s", device)
+    logger.info("merge_adapters using device=%s, base=%s", device, base_model_repo)
 
-    # load_all verifies each adapter against locked_spec and raises on mismatch.
     adapters_by_domain = load_all(adapters_dir, locked_spec, device=device)
-    task_vectors = list(adapters_by_domain.values())  # canonical-order list
+    task_vectors = list(adapters_by_domain.values())
     logger.info(
         "Loaded %d adapters for merge (domains=%s, method=%s)",
         len(task_vectors), list(adapters_by_domain.keys()), method,
@@ -180,34 +168,117 @@ def merge_adapters(
     merge_fn = METHOD_REGISTRY[method]
     merged = merge_fn(task_vectors, **kwargs)
 
-    # SVD-factor each merged ΔW into (lora_A, lora_B), assemble PEFT-named dict.
-    peft_state: dict[str, Any] = {}
+    factorized: dict[str, tuple[Any, Any]] = {}
     for canonical, delta_w in merged.items():
         lora_a, lora_b = svd_factor(delta_w, r=r, alpha=alpha)
-        peft_state[decanonicalize(canonical, "lora_A")] = lora_a
-        peft_state[decanonicalize(canonical, "lora_B")] = lora_b
+        factorized[canonical] = (lora_a, lora_b)
+    logger.info("SVD-factored %d merged ΔW tensors to rank-%d", len(factorized), r)
 
-    # Save weights then config. Order is incidental, but config-last lets a
-    # mid-run failure leave only the safetensors file (clearly broken).
-    # safetensors refuses to save non-contiguous tensors (views, slices, broadcasts).
-    # SVD factorization in svd_factor() produces views; force a copy here.
-    # When device != cpu, .to("cpu") materializes a CPU copy; safetensors then
-    # gets contiguous CPU tensors regardless of where the merge ran.
-    peft_state = {k: v.detach().to("cpu").contiguous() for k, v in peft_state.items()}
-    safetensors_save_file(peft_state, str(output_dir / "adapter_model.safetensors"))
+    logger.info("Loading base model %s onto %s", base_model_repo, device)
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_repo,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+    )
 
-    # The four adapters are byte-identical on the 8 load-bearing fields; using
-    # math's config carries through any teammate-supplied PEFT bookkeeping too.
-    source = adapters_dir / CANONICAL_DOMAINS[0]
-    _copy_adapter_config(source, output_dir)
+    lora_config = LoraConfig(
+        r=int(locked_spec["r"]),
+        lora_alpha=int(locked_spec["lora_alpha"]),
+        lora_dropout=float(locked_spec["lora_dropout"]),
+        target_modules=list(locked_spec["target_modules"]),
+        bias=locked_spec["bias"],
+        task_type=locked_spec["task_type"],
+    )
+    logger.info("Wrapping base model with PEFT LoraConfig (r=%d, alpha=%d)", r, alpha)
+    peft_model = get_peft_model(base, lora_config)
+
+    # Translate canonical names to the PEFT-format keys present in
+    # peft_model.state_dict(). decanonicalize() builds the same
+    # 'base_model.model.<canonical>.lora_{A,B}.default.weight' format that
+    # load_adapter.canonicalize() inverts.
+    state_update: dict[str, Any] = {}
+    existing_state = peft_model.state_dict()
+    for canonical, (lora_a, lora_b) in factorized.items():
+        a_key = decanonicalize(canonical, "lora_A")
+        b_key = decanonicalize(canonical, "lora_B")
+        if a_key not in existing_state or b_key not in existing_state:
+            raise KeyError(
+                f"PEFT wrapper has no parameter named {a_key!r} or {b_key!r}; "
+                f"check that LoraConfig target_modules match the base model "
+                f"architecture (got target_modules={locked_spec['target_modules']!r})"
+            )
+        ref_a = existing_state[a_key]
+        ref_b = existing_state[b_key]
+        state_update[a_key] = lora_a.to(device=ref_a.device, dtype=ref_a.dtype)
+        state_update[b_key] = lora_b.to(device=ref_b.device, dtype=ref_b.dtype)
+
+    missing, unexpected = peft_model.load_state_dict(state_update, strict=False)
+    if unexpected:
+        logger.warning(
+            "load_state_dict reported %d unexpected keys: %s",
+            len(unexpected), unexpected[:5],
+        )
+    logger.info(
+        "Injected %d LoRA tensors into PEFT wrapper (%d base params untouched)",
+        len(state_update), len(missing),
+    )
+
+    sample_key = next(iter(state_update.keys()))
+    after = peft_model.state_dict()[sample_key]
+    if not torch.allclose(
+        after.detach().to(state_update[sample_key].device, state_update[sample_key].dtype),
+        state_update[sample_key],
+        rtol=1e-3,
+        atol=1e-3,
+    ):
+        raise RuntimeError(
+            f"PEFT injection check failed: load_state_dict did not write {sample_key}. "
+            "Check PEFT version compatibility (expected base_model.model.* key prefix)."
+        )
+
+    logger.info("Running merge_and_unload to bake deltas into base weights")
+    merged_model = peft_model.merge_and_unload()
+
+    logger.info("Saving full merged model to %s", output_dir)
+    merged_model.save_pretrained(
+        output_dir,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+
+    logger.info("Saving tokenizer from %s", base_model_repo)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_repo)
+    tokenizer.save_pretrained(output_dir)
+
+    chat_template_src = DEFAULT_CHAT_TEMPLATE
+    if chat_template_src.exists():
+        shutil.copy2(chat_template_src, output_dir / "chat_template.jinja")
+        logger.info("Copied locked chat_template.jinja to %s", output_dir)
+    else:
+        logger.warning(
+            "Locked chat template not found at %s; merged model will use the "
+            "tokenizer's bundled template.",
+            chat_template_src,
+        )
 
     if generation_config is not None:
-        gen_config_path = output_dir / "generation_config.json"
-        with gen_config_path.open("w") as f:
+        gen_path = output_dir / "generation_config.json"
+        with gen_path.open("w") as f:
             json.dump(generation_config, f, indent=2)
-        logger.info("Wrote generation_config.json to %s", gen_config_path)
+        logger.info("Wrote generation_config.json to %s", gen_path)
+
+    del peft_model, merged_model, base, state_update, existing_state, factorized
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return output_dir
 
 
-__all__ = ["merge_adapters", "svd_factor", "DEFAULT_LOCKED_SPEC", "REPO_ROOT"]
+__all__ = [
+    "merge_adapters",
+    "svd_factor",
+    "DEFAULT_LOCKED_SPEC",
+    "DEFAULT_CHAT_TEMPLATE",
+    "REPO_ROOT",
+]

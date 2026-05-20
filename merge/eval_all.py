@@ -243,7 +243,6 @@ def _score_one_benchmark(items: list[dict[str, Any]], method: str) -> tuple[
 
 def evaluate_one_benchmark(
     vllm_model,
-    lora_request,
     benchmark: str,
     validation_jsonl_path: Path,
     output_dir: Path,
@@ -265,7 +264,6 @@ def evaluate_one_benchmark(
 
     run_inference(
         vllm_model=vllm_model,
-        lora_request=lora_request,
         benchmark_name=benchmark,
         validation_jsonl_path=validation_jsonl_path,
         output_jsonl_path=generations_path,
@@ -337,8 +335,15 @@ def evaluate_all_benchmarks(
     """Top-level orchestrator. Loads vLLM once, runs all 4 benchmarks.
 
     Args:
-        merged_adapter_dir: PEFT-format adapter from ``pipeline.merge_adapters``.
-        base_model_repo: HF repo for base model (e.g. ``"Qwen/Qwen3-1.7B"``).
+        merged_adapter_dir: Full HF-format model directory produced by
+            :func:`merge.pipeline.merge_adapters`. The directory contains
+            the merged Qwen3-1.7B (config.json + model.safetensors), the
+            tokenizer, the locked chat template, and optionally a
+            generation_config.json.
+        base_model_repo: Retained for backwards compatibility; ignored.
+            vLLM now loads the merged dir directly as a full model. The
+            argument stays in the signature so callers (e.g.
+            ``scripts/eval_sweep.py``) don't need to be re-plumbed.
         output_dir: Where to write all results. Created if missing.
         validation_samples_dir: Path to ``validation_samples/`` with the 4
             domain JSONLs.
@@ -360,7 +365,7 @@ def evaluate_all_benchmarks(
         - Writes ``output_dir/failures_<benchmark>.json`` × 4
     """
     if not merged_adapter_dir.exists():
-        raise FileNotFoundError(f"Merged adapter dir not found: {merged_adapter_dir}")
+        raise FileNotFoundError(f"Merged model dir not found: {merged_adapter_dir}")
     if not validation_samples_dir.exists():
         raise FileNotFoundError(
             f"Validation samples dir not found: {validation_samples_dir}"
@@ -383,22 +388,13 @@ def evaluate_all_benchmarks(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Lazy imports — vllm pulls CUDA and is ~10s to import.
+    # Lazy import — vllm pulls CUDA and is ~10s to import.
     from vllm import LLM
-    from vllm.lora.request import LoRARequest
 
-    logger.info("Loading vLLM base=%s with LoRA adapter=%s",
-                base_model_repo, merged_adapter_dir)
+    logger.info("Loading vLLM with full merged model at %s", merged_adapter_dir)
     llm = LLM(
-        model=base_model_repo,
-        enable_lora=True,
-        max_lora_rank=32,
+        model=str(merged_adapter_dir),
         dtype="bfloat16",
-    )
-    lora_request = LoRARequest(
-        lora_name="merged",
-        lora_int_id=1,
-        lora_path=str(merged_adapter_dir),
     )
 
     results: dict[str, BenchmarkResult] = {}
@@ -411,7 +407,6 @@ def evaluate_all_benchmarks(
                 )
             result, _failures = evaluate_one_benchmark(
                 vllm_model=llm,
-                lora_request=lora_request,
                 benchmark=benchmark,
                 validation_jsonl_path=jsonl,
                 output_dir=output_dir,

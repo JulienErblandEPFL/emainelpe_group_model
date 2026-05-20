@@ -77,7 +77,14 @@ entirely.
   is an error.
 - **Pipeline I/O contract**: input = local directory of PEFT-format
   adapters (no HF download in the pipeline itself). Output = local
-  PEFT-format merged adapter, ready for `load()` round-trip.
+  **full HF-format model directory** (`config.json` + `model.safetensors`
+  + tokenizer + `chat_template.jinja`), produced by
+  `peft.merge_and_unload` baking the merged deltas into a fresh copy of
+  the Qwen3-1.7B base. Merged adapter dirs are now full Qwen3-1.7B-with-deltas
+  models (~3.4 GB each), not LoRA adapters. Caused by vLLM's LoRA loader
+  rejecting PEFT-format weight keys
+  (`base_model.model.model.layers.X.mlp.down_proj.lora_A.default.weight`
+  is `unsupported LoRA weight`). See Day 7 entry in PROCESS_BOOK.
 - **Dependencies**: Python dependencies for the merge subdir are listed in
   `requirements.txt` at the repo root.
 - **Generation config**: structure is locked (token IDs from project

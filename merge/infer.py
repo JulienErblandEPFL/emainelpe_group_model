@@ -137,7 +137,6 @@ def _render_chat_prompt(tokenizer, problem_text: str) -> str:
 
 def run_inference(
     vllm_model,
-    lora_request,
     benchmark_name: str,
     validation_jsonl_path: Path,
     output_jsonl_path: Path,
@@ -152,9 +151,10 @@ def run_inference(
     consumed by the failure classifier downstream.
 
     Args:
-        vllm_model: A loaded ``vllm.LLM`` instance, owned by the caller.
-        lora_request: A ``vllm.lora.request.LoRARequest`` for the merged
-            adapter, or ``None`` to run against the bare base model.
+        vllm_model: A loaded ``vllm.LLM`` instance, owned by the caller. As
+            of Day 7 (2026-05-20) this is a full merged model — the LoRA
+            request plumbing was removed when vLLM's LoRA loader rejected
+            our PEFT-format adapter keys.
         benchmark_name: One of the 4 canonical domain names (used for logging).
         validation_jsonl_path: Source problems.
         output_jsonl_path: Destination JSONL. Parent dir is created if missing.
@@ -198,12 +198,8 @@ def run_inference(
         benchmark_name, config.n, config.max_tokens, len(prompts),
     )
 
-    gen_kwargs: dict[str, Any] = {"sampling_params": sampling_params}
-    if lora_request is not None:
-        gen_kwargs["lora_request"] = lora_request
-
     try:
-        request_outputs = vllm_model.generate(prompts, **gen_kwargs)
+        request_outputs = vllm_model.generate(prompts, sampling_params=sampling_params)
     except Exception as exc:
         raise RuntimeError(f"vLLM generation failed for {benchmark_name}: {exc}") from exc
 

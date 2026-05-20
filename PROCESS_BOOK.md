@@ -768,3 +768,115 @@ Two performance/process fixes ahead of the bake-off:
 - None blocking. If a temperature consistently OOMs at the project's
   max-tokens setting, we may want a per-temperature `max_tokens`
   override on the sweep CLI — defer until we see it happen.
+
+
+## Day 7 — 2026-05-20 — vLLM LoRA loader rejects PEFT format; switch to full-model merge output
+
+### What happened
+
+Stage 5c.1.5 cluster smoke for `eval_sweep.py` on a merged adapter failed
+at vLLM's LoRA loader on the first generation:
+
+```
+ValueError: base_model.model.model.layers.0.mlp.down_proj.lora_A.default.weight is unsupported LoRA weight
+```
+
+vLLM's `parse_fine_tuned_lora_name` couldn't parse our PEFT-format weight
+keys. Reproduced across all 3 temperatures (0.3, 0.5, 0.7). Failure is in
+the LoRA loader, not our merge pipeline — the merged adapter was valid
+PEFT format (uniform method on 4 random-init Qwen3-sized adapters;
+produced 196 task-vector entries × correct shapes; verified by our own
+`load_adapter.load()`).
+
+### Decision
+
+Change `pipeline.merge_adapters` to always produce a full HF-format model
+via `peft.merge_and_unload()` instead of a LoRA-only output. Drop
+`enable_lora=True` from eval entirely.
+
+### Rationale
+
+- vLLM's LoRA support is too restrictive for our SVD-factorized output.
+  We could investigate which keys it accepts (the `.default.` adapter-name
+  segment? `down_proj` target?) but that's a black box we don't control.
+- Full-model output matches what the May 24 milestone CI grades anyway.
+- The math-track has been doing `merge_and_push.py` with `merge_and_unload`
+  for the same reason. Group-track now does the same.
+- Disk cost: 4 methods × ~3.4 GB = ~14 GB on `/scratch`. Trivial.
+- Merge time cost: +30-60 sec per merge for `merge_and_unload` +
+  `save_pretrained`. Trivial in the context of a 3+ hour bake-off.
+
+### Implementation
+
+- `pipeline.merge_adapters` now: `load_all` (GPU) → merge method → SVD
+  factor → in-memory PEFT model with our factors injected via
+  `load_state_dict(strict=False)` → sanity-check one injection survived
+  → `merge_and_unload` → `save_pretrained` → copy tokenizer + locked
+  `chat_template.jinja` + optional `generation_config.json`.
+- New parameter `base_model_repo: str = "Qwen/Qwen3-1.7B"` lets future
+  experiments swap the base without code changes.
+- `evaluate_all_benchmarks` loads the merged dir as a full model:
+  `LLM(model=merged_dir, dtype="bfloat16")`. No more `enable_lora` /
+  `LoRARequest`. The `base_model_repo` parameter remains in the
+  signature for caller compatibility but is now ignored — vLLM reads
+  the model directly from the merged directory.
+- `run_inference` drops the `lora_request` parameter; vLLM `.generate`
+  is called with `sampling_params=` only.
+- `scripts/eval_sweep.py` `validate_args` checks for `config.json` +
+  (`model.safetensors` or `model.safetensors.index.json` for sharded
+  variants) instead of the legacy `adapter_*` files.
+
+### Test surface
+
+- Pipeline integration tests can no longer round-trip the toy adapters
+  (hidden=64) through `merge_adapters` because the in-memory PEFT
+  wrapper has Qwen3 shapes (hidden=2048). Two affected test files:
+  - `merge/tests/test_pipeline.py` — kept error-path tests (KeyError,
+    FileNotFoundError, SpecMismatchError, FileExistsError, adamerging
+    `forward_fn` missing) — all raise before base-model load and stay
+    laptop-runnable. Happy-path tests rewritten with a new
+    `qwen3_random_adapters_dir` fixture and gated on CUDA +
+    transformers + peft (cluster only).
+  - `merge/tests/test_pipeline_synthetic.py` — replaced all toy-adapter
+    end-to-end tests with a single cluster-gated set that asserts
+    `config.json` + `model.safetensors` + tokenizer + chat template
+    are present and that `AutoModelForCausalLM.from_pretrained` round-
+    trips. The rank-r truncation discipline is verified in isolation
+    by `test_svd_factor_round_trip_within_truncation_tolerance` in
+    `test_pipeline.py`.
+- `test_pipeline_cpu_and_cuda_produce_equivalent_output` in
+  `test_load_adapter.py` skipped with a TODO — natural CPU/GPU parity
+  assertion is now on the baked Qwen3 model weights, not the SVD
+  factors. Verified manually on cluster smoke or as a follow-up.
+- `merge/tests/test_eval_sweep.py` updated: fake adapter dir helpers
+  now write `config.json` + `model.safetensors`; new test for the
+  sharded variant.
+
+### Verified (laptop)
+
+- Code paths: `pipeline.merge_adapters`, `eval_all.evaluate_all_benchmarks`,
+  `infer.run_inference`, `scripts/eval_sweep.py::validate_args`.
+- `pytest merge/tests/ -v` runs to completion with the new test layout
+  (most pipeline integration tests skip on CUDA absence as expected).
+
+### Verified (cluster)
+
+- *To fill in after the next `runai submit`: confirm
+  `pipeline.merge_adapters` on the 4 random Qwen3 adapters writes a
+  full HF-format directory of size ~3.4 GB; confirm `eval_sweep.py
+  --temperatures 0.3 0.5 0.7` against that directory produces three
+  scorecards without the original `unsupported LoRA weight` error.*
+
+### Open questions / follow-ups
+
+- Disk-space management: the bake-off will produce 4 × 3.4 GB = ~14 GB
+  on `/scratch`. Default: keep all dirs for post-hoc analysis; document
+  a clean-up command if disk gets tight.
+- Should we expose a `--lora-only` flag on `merge_adapters` for callers
+  who want the LoRA-only path back? Skip until requested — no current
+  consumer needs it.
+- `scripts/smoke_adamerging.py` still asserts the legacy
+  `adapter_*` files post-merge (listed as don't-touch in the refactor
+  prompt). Its post-merge assertions will need updating to the
+  full-model layout before the next smoke run; flagged here as
+  follow-up.

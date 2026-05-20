@@ -41,8 +41,8 @@ LoRA shape (`r=32`, `α=64`, 7 target projections, `modules_to_save=null`).
 ## Pipeline
 
 ```
-verify_spec  →  load_adapter  →  methods.<method>  →  pipeline.save  →  publish  →  eval_all
-   (CPU)         (HF download)    (CPU tensor math)    (CPU IO)        (HF upload)  (CPU IO)
+verify_spec  →  load_adapter  →  methods.<method>  →  pipeline.bake  →  publish  →  eval_all
+   (CPU)         (load on GPU)    (GPU tensor math)    (GPU + save)    (HF upload)  (vLLM)
 ```
 
 1. **verify_spec** — diff each input adapter's `adapter_config.json` against
@@ -57,12 +57,39 @@ verify_spec  →  load_adapter  →  methods.<method>  →  pipeline.save  →  
    getting the four adapters onto disk first.
 3. **methods.\<method\>** — dispatch through `METHOD_REGISTRY` and run the
    chosen merge in pure tensor math.
-4. **pipeline.save** — write the merged dict as a PEFT-loadable adapter
-   directory (`adapter_config.json` + `adapter_model.safetensors`).
+4. **pipeline.bake** — SVD-truncate the merged ΔW back to rank-r, inject
+   the factors into a fresh PEFT wrapper around the base model, run
+   `peft.merge_and_unload` to bake the deltas into the base weights, and
+   save the resulting full model via `transformers.save_pretrained`. The
+   on-disk artifact is a self-contained HF-format directory (`config.json`
+   + `model.safetensors`), not a LoRA adapter. (See Day 7 in PROCESS_BOOK
+   for the rationale — vLLM's LoRA loader rejected our PEFT-format keys.)
 5. **publish** — upload to `cs-552-2026-emainelpe/group_model` via
    `huggingface_hub.HfApi.upload_folder`.
 6. **eval_all** — generate completions against `../validation_samples/*.jsonl`
-   and score with `../evaluate/`. Compute the 4-domain leaderboard average.
+   via vLLM loaded directly on the merged model dir (no LoRA adapter
+   plumbing), and score with `../evaluate/`. Compute the 4-domain
+   leaderboard average.
+
+### Output format (Day 7 refactor)
+
+`pipeline.merge_adapters` writes a full HF-format model directory:
+
+```
+<output_dir>/
+    config.json
+    model.safetensors          # ~3.4 GB for Qwen3-1.7B in bf16, sharded if larger
+    tokenizer.json
+    tokenizer_config.json
+    special_tokens_map.json
+    chat_template.jinja        # copied from <repo>/chat_template.jinja
+    generation_config.json     # written iff generation_config kwarg provided
+```
+
+The intermediate LoRA factorization stays in GPU memory and never hits
+disk. Downstream consumers (vLLM, the CI grader, `publish.py`) load this
+directly via `AutoModelForCausalLM.from_pretrained` or
+`LLM(model=<output_dir>)` — no LoRA bookkeeping required.
 
 ## Method registry
 
@@ -174,13 +201,17 @@ python scripts/smoke_adamerging.py --max-steps 50
 
 - **`merge/infer.py`** — vLLM-based n=8 inference for one benchmark.
   Renders prompts through the Qwen3 chat template
-  (`add_generation_prompt=True`), calls `vllm.LLM.generate(...)` with the
-  merged adapter passed as a `LoRARequest`, and writes a generations JSONL
-  shaped exactly like the input `evaluate.score` consumes.
-- **`merge/eval_all.py`** — orchestrator: loads vLLM once
-  (`enable_lora=True, max_lora_rank=32`), runs all 4 benchmarks, scores
-  via the existing `evaluate/*` helpers (pass@1, pass@8), and classifies
-  every pass@8=0 failure into one of 7 categories.
+  (`add_generation_prompt=True`), calls `vllm.LLM.generate(prompts,
+  sampling_params=...)` against a vLLM model loaded directly on the
+  merged-model directory, and writes a generations JSONL shaped exactly
+  like the input `evaluate.score` consumes. (Day 7: the `LoRARequest`
+  plumbing was dropped — vLLM consumes the merged model as a full HF
+  checkpoint now.)
+- **`merge/eval_all.py`** — orchestrator: loads vLLM once on the merged
+  model dir (`LLM(model=merged_adapter_dir, dtype="bfloat16")`), runs
+  all 4 benchmarks, scores via the existing `evaluate/*` helpers
+  (pass@1, pass@8), and classifies every pass@8=0 failure into one of
+  7 categories.
 - **Failure taxonomy** (`merge.eval_all.FailureCategory`):
   `no_boxed`, `empty_boxed`, `wrong_answer`, `malformed_answer`,
   `truncated`, `refusal`, `mixed`. Per-problem detail (with the 8

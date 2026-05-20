@@ -44,11 +44,15 @@ sweep_mod = _load_eval_sweep()
 # ---------------------------------------------------------------------------
 
 def _make_valid_adapter_dir(tmp_path: Path) -> Path:
-    """Create a fake merged-adapter directory with the two files validate_args checks."""
+    """Create a fake merged-model directory with the two files validate_args checks.
+
+    After the Day 7 refactor, ``merged_adapter_dir`` is a full HF-format
+    model directory (config.json + model.safetensors), not a PEFT adapter.
+    """
     adapter_dir = tmp_path / "merged"
     adapter_dir.mkdir()
-    (adapter_dir / "adapter_config.json").write_text("{}")
-    (adapter_dir / "adapter_model.safetensors").write_bytes(b"")
+    (adapter_dir / "config.json").write_text("{}")
+    (adapter_dir / "model.safetensors").write_bytes(b"")
     return adapter_dir
 
 
@@ -129,18 +133,27 @@ def test_validate_args_missing_adapter_dir(tmp_path: Path) -> None:
     assert any("not a directory" in e for e in errors)
 
 
-def test_validate_args_missing_adapter_config(tmp_path: Path) -> None:
+def test_validate_args_missing_config_json(tmp_path: Path) -> None:
     args = _build_args(tmp_path)
-    (args.merged_adapter_dir / "adapter_config.json").unlink()
+    (args.merged_adapter_dir / "config.json").unlink()
     errors = sweep_mod.validate_args(args)
-    assert any("adapter_config.json missing" in e for e in errors)
+    assert any("config.json missing" in e for e in errors)
 
 
 def test_validate_args_missing_safetensors(tmp_path: Path) -> None:
     args = _build_args(tmp_path)
-    (args.merged_adapter_dir / "adapter_model.safetensors").unlink()
+    (args.merged_adapter_dir / "model.safetensors").unlink()
     errors = sweep_mod.validate_args(args)
-    assert any("adapter_model.safetensors missing" in e for e in errors)
+    assert any("model.safetensors" in e and "missing" in e for e in errors)
+
+
+def test_validate_args_accepts_sharded_safetensors(tmp_path: Path) -> None:
+    """A sharded model (model.safetensors.index.json + model-0000N-of-M shards)
+    is the alternative valid layout transformers writes for >5GB models."""
+    args = _build_args(tmp_path)
+    (args.merged_adapter_dir / "model.safetensors").unlink()
+    (args.merged_adapter_dir / "model.safetensors.index.json").write_text("{}")
+    assert sweep_mod.validate_args(args) == []
 
 
 def test_validate_args_missing_validation_dir(tmp_path: Path) -> None:

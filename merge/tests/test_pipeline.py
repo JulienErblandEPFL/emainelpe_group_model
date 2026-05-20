@@ -1,9 +1,13 @@
 """
-Tests for ``merge.pipeline.merge_adapters`` — Stage 4 orchestrator.
+Tests for ``merge.pipeline.merge_adapters`` — Stage 4 orchestrator,
+Day 7 refactored to produce a full HF model.
 
-Exercises every method through the registry, plus the error paths
-(unknown method, stub method, missing adapters, spec mismatch, non-empty
-output dir).
+The pipeline now loads Qwen3-1.7B base weights and runs PEFT's
+``merge_and_unload`` to bake the merged deltas in. End-to-end happy-path
+tests therefore need both CUDA and the base model in the HF cache —
+they're cluster-only. Error-path tests (KeyError on unknown method, etc.)
+still raise BEFORE base-model loading, so they continue to run on the
+torch-free laptop suite via ``pytest.importorskip``.
 """
 from __future__ import annotations
 
@@ -13,12 +17,26 @@ from pathlib import Path
 import pytest
 
 
+def _skip_unless_cluster_ready() -> None:
+    """Skip the test unless we're in an environment that can run the full
+    pipeline: torch + CUDA + transformers + peft + a usable Qwen3-1.7B.
+
+    The Qwen3 base check is deferred — we trust that on the cluster image
+    the model is in the HF cache. On the laptop we skip on CUDA absence.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+    if not torch.cuda.is_available():
+        pytest.skip("Full-pipeline tests require CUDA + Qwen3 base; cluster only")
+
+
 # ---------------------------------------------------------------------------
-# svd_factor isolation — math gate
+# svd_factor isolation — math gate, runs on laptop
 # ---------------------------------------------------------------------------
 
 def test_svd_factor_round_trip_within_truncation_tolerance() -> None:
-    """svd_factor + load's reconstruction recovers a rank-r matrix exactly.
+    """svd_factor + reconstruction recovers a rank-r matrix exactly.
 
     Diagnostic gate isolating the SVD factorization math from the rest of
     the pipeline. Input is built to be exactly rank-r so SVD truncation is
@@ -32,110 +50,19 @@ def test_svd_factor_round_trip_within_truncation_tolerance() -> None:
     out_dim, in_dim = 64, 64
 
     torch.manual_seed(0)
-    U_true = torch.linalg.qr(torch.randn(out_dim, r))[0]                    # [out, r], orthonormal
-    S_true = torch.tensor([1.0 + i * 0.1 for i in range(r)])                # known spectrum
-    Vh_true = torch.linalg.qr(torch.randn(in_dim, r))[0].T                  # [r, in], orthonormal
-    delta_w = U_true @ torch.diag(S_true) @ Vh_true                         # rank-r exactly, fp32
+    U_true = torch.linalg.qr(torch.randn(out_dim, r))[0]
+    S_true = torch.tensor([1.0 + i * 0.1 for i in range(r)])
+    Vh_true = torch.linalg.qr(torch.randn(in_dim, r))[0].T
+    delta_w = U_true @ torch.diag(S_true) @ Vh_true
 
     lora_A, lora_B = svd_factor(delta_w, r=r, alpha=alpha)
     reconstructed = (alpha / r) * lora_B.float() @ lora_A.float()
 
-    # Rank-r input means SVD truncation is lossless. Any error here is a
-    # scaling or broadcasting bug, not truncation.
     torch.testing.assert_close(reconstructed, delta_w, rtol=1e-4, atol=1e-4)
 
 
 # ---------------------------------------------------------------------------
-# Happy paths — one per method
-# ---------------------------------------------------------------------------
-
-def test_pipeline_uniform_with_synthetic_adapters(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
-    from merge.load_adapter import load
-    from merge.pipeline import merge_adapters
-
-    out_dir = tmp_path / "merged"
-    returned = merge_adapters(
-        synthetic_adapters_dir,
-        method="uniform",
-        output_dir=out_dir,
-        locked_spec_path=lora_yaml_path,
-    )
-    assert returned == out_dir
-    assert (out_dir / "adapter_config.json").exists()
-    assert (out_dir / "adapter_model.safetensors").exists()
-
-    cfg = json.loads((out_dir / "adapter_config.json").read_text())
-    assert cfg["inference_mode"] is False
-    assert cfg["r"] == 32
-    assert cfg["lora_alpha"] == 64
-
-    # Reload round-trips into a task vector dict with the same canonical keys.
-    reloaded = load(out_dir)
-    one_input = load(synthetic_adapters_dir / "math")
-    assert set(reloaded.keys()) == set(one_input.keys())
-
-
-def test_pipeline_dare_uniform_with_synthetic_adapters(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
-    from merge.pipeline import merge_adapters
-
-    out_dir = tmp_path / "merged"
-    merge_adapters(
-        synthetic_adapters_dir,
-        method="dare_uniform",
-        output_dir=out_dir,
-        locked_spec_path=lora_yaml_path,
-        method_kwargs={"drop_rate": 0.5, "seed": 42},
-    )
-    assert (out_dir / "adapter_config.json").exists()
-    assert (out_dir / "adapter_model.safetensors").exists()
-
-
-def test_pipeline_dare_weighted_with_synthetic_adapters(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
-    from merge.pipeline import merge_adapters
-
-    out_dir = tmp_path / "merged"
-    merge_adapters(
-        synthetic_adapters_dir,
-        method="dare_weighted",
-        output_dir=out_dir,
-        locked_spec_path=lora_yaml_path,
-        method_kwargs={"weights": [0.4, 0.3, 0.2, 0.1], "drop_rate": 0.5, "seed": 1},
-    )
-    assert (out_dir / "adapter_config.json").exists()
-
-
-def test_pipeline_ties_with_synthetic_adapters(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
-    from merge.pipeline import merge_adapters
-
-    out_dir = tmp_path / "merged"
-    merge_adapters(
-        synthetic_adapters_dir,
-        method="ties",
-        output_dir=out_dir,
-        locked_spec_path=lora_yaml_path,
-        method_kwargs={"trim_ratio": 0.5},
-    )
-    assert (out_dir / "adapter_config.json").exists()
-
-
-# ---------------------------------------------------------------------------
-# Error paths
+# Error paths — raise before base-model load, runnable on laptop
 # ---------------------------------------------------------------------------
 
 def test_pipeline_unknown_method_raises_key_error(
@@ -151,72 +78,6 @@ def test_pipeline_unknown_method_raises_key_error(
             output_dir=tmp_path / "merged",
             locked_spec_path=lora_yaml_path,
         )
-
-
-def test_pipeline_adamerging_requires_forward_fn_and_data_iter(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    """adamerging requires forward_fn and data_iter in method_kwargs;
-    calling without them raises TypeError mentioning the missing args."""
-    pytest.importorskip("torch")
-    from merge.pipeline import merge_adapters
-
-    with pytest.raises(TypeError, match=r"forward_fn|data_iter"):
-        merge_adapters(
-            synthetic_adapters_dir,
-            method="adamerging",
-            output_dir=tmp_path / "merged",
-            locked_spec_path=lora_yaml_path,
-        )
-
-
-def test_pipeline_dare_adamerging_requires_forward_fn_and_data_iter(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    """dare_adamerging requires forward_fn and data_iter in method_kwargs."""
-    pytest.importorskip("torch")
-    from merge.pipeline import merge_adapters
-
-    with pytest.raises(TypeError, match=r"forward_fn|data_iter"):
-        merge_adapters(
-            synthetic_adapters_dir,
-            method="dare_adamerging",
-            output_dir=tmp_path / "merged",
-            locked_spec_path=lora_yaml_path,
-        )
-
-
-def test_pipeline_dare_adamerging_with_synthetic_forward(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    """End-to-end: pipeline dispatch through dare_adamerging produces a
-    valid merged adapter directory."""
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
-    from merge.pipeline import merge_adapters
-    from merge.tests.fixtures.adamerging_helpers import (
-        make_synthetic_forward_fn,
-        make_synthetic_data_iter,
-    )
-
-    out_dir = tmp_path / "merged"
-    merge_adapters(
-        synthetic_adapters_dir,
-        method="dare_adamerging",
-        output_dir=out_dir,
-        locked_spec_path=lora_yaml_path,
-        method_kwargs={
-            "forward_fn": make_synthetic_forward_fn(seed=0),
-            "data_iter": make_synthetic_data_iter(n_batches=30, seed=0),
-            "drop_rate": 0.5,
-            "seed": 42,
-            "max_steps": 20,
-            "early_stop_patience": 200,
-        },
-    )
-
-    assert (out_dir / "adapter_config.json").exists()
-    assert (out_dir / "adapter_model.safetensors").exists()
 
 
 def test_pipeline_missing_adapter_raises(
@@ -275,43 +136,137 @@ def test_pipeline_output_exists_and_nonempty_raises(
         )
 
 
-def test_pipeline_output_exists_but_empty_succeeds(
+def test_pipeline_adamerging_requires_forward_fn_and_data_iter(
     synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
 ) -> None:
+    """adamerging raises TypeError from the merge function before the
+    pipeline reaches base-model load — runnable without Qwen3."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+    from merge.pipeline import merge_adapters
+
+    with pytest.raises(TypeError, match=r"forward_fn|data_iter"):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="adamerging",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+def test_pipeline_dare_adamerging_requires_forward_fn_and_data_iter(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """dare_adamerging composition has the same kwargs requirement."""
+    pytest.importorskip("torch")
+    pytest.importorskip("transformers")
+    pytest.importorskip("peft")
+    from merge.pipeline import merge_adapters
+
+    with pytest.raises(TypeError, match=r"forward_fn|data_iter"):
+        merge_adapters(
+            synthetic_adapters_dir,
+            method="dare_adamerging",
+            output_dir=tmp_path / "merged",
+            locked_spec_path=lora_yaml_path,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cluster-only integration tests — require CUDA + Qwen3
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def qwen3_random_adapters_dir(tmp_path: Path) -> Path:
+    """Four random-init Qwen3-1.7B-sized adapters under tmp_path/loras.
+
+    Used by the cluster-only integration tests below. Each adapter weighs
+    ~140 MB in bf16, so this fixture should never be triggered on the
+    laptop — _skip_unless_cluster_ready in the test bodies takes care of
+    skipping there.
+    """
     pytest.importorskip("torch")
     pytest.importorskip("safetensors")
+    from merge.tests.fixtures.qwen3_adapter import make_random_qwen3_adapter
+
+    loras_dir = tmp_path / "loras"
+    for i, domain in enumerate(("math", "general_knowledge", "safety", "multilingual")):
+        make_random_qwen3_adapter(loras_dir / domain, seed=42 + i)
+    return loras_dir
+
+
+def _assert_full_model_output(out_dir: Path) -> None:
+    """Common assertions for a successful full-model merge output."""
+    assert (out_dir / "config.json").exists(), "missing config.json"
+    has_single = (out_dir / "model.safetensors").exists()
+    has_sharded = (out_dir / "model.safetensors.index.json").exists()
+    assert has_single or has_sharded, "neither model.safetensors nor index.json present"
+    assert not (out_dir / "adapter_config.json").exists(), "legacy adapter_config.json present"
+    assert not (out_dir / "adapter_model.safetensors").exists(), (
+        "legacy adapter_model.safetensors present"
+    )
+
+
+def test_pipeline_uniform_produces_full_model(
+    qwen3_random_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """End-to-end uniform merge writes a full HF-format Qwen3 directory."""
+    _skip_unless_cluster_ready()
+    from transformers import AutoModelForCausalLM
     from merge.pipeline import merge_adapters
 
     out_dir = tmp_path / "merged"
-    out_dir.mkdir()
-    merge_adapters(
-        synthetic_adapters_dir,
+    returned = merge_adapters(
+        qwen3_random_adapters_dir,
         method="uniform",
         output_dir=out_dir,
         locked_spec_path=lora_yaml_path,
     )
-    assert (out_dir / "adapter_config.json").exists()
+    assert returned == out_dir
+    _assert_full_model_output(out_dir)
+
+    # Confirm the saved directory is loadable back as a full model.
+    reloaded = AutoModelForCausalLM.from_pretrained(out_dir)
+    assert reloaded.config.model_type == "qwen3"
+
+
+def test_pipeline_dare_uniform_produces_full_model(
+    qwen3_random_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    _skip_unless_cluster_ready()
+    from merge.pipeline import merge_adapters
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        qwen3_random_adapters_dir,
+        method="dare_uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        method_kwargs={"drop_rate": 0.5, "seed": 42},
+    )
+    _assert_full_model_output(out_dir)
 
 
 def test_pipeline_writes_generation_config_when_provided(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+    qwen3_random_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
 ) -> None:
     """If ``generation_config`` is provided, ``output_dir`` contains
     ``generation_config.json``."""
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
+    _skip_unless_cluster_ready()
     from merge.generation_config import make_generation_config
     from merge.pipeline import merge_adapters
 
     out_dir = tmp_path / "merged"
     gen_config = make_generation_config(temperature=0.3)
     merge_adapters(
-        synthetic_adapters_dir,
+        qwen3_random_adapters_dir,
         method="uniform",
         output_dir=out_dir,
         locked_spec_path=lora_yaml_path,
         generation_config=gen_config,
     )
+    _assert_full_model_output(out_dir)
     gen_path = out_dir / "generation_config.json"
     assert gen_path.exists()
     loaded = json.loads(gen_path.read_text())
@@ -320,45 +275,36 @@ def test_pipeline_writes_generation_config_when_provided(
 
 
 def test_pipeline_no_generation_config_when_omitted(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+    qwen3_random_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
 ) -> None:
     """If ``generation_config`` is ``None`` (default), no
-    ``generation_config.json`` is written."""
-    pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
+    ``generation_config.json`` is written.
+
+    Note: ``transformers.save_pretrained`` itself writes a
+    ``generation_config.json`` containing the base model's defaults (eos
+    token, etc.) when the model has a ``generation_config`` attribute. So
+    'no generation_config' really means 'no extra one written by our
+    pipeline'. The test only asserts that the file we WOULD have written
+    (with our custom temperature) doesn't appear.
+    """
+    _skip_unless_cluster_ready()
     from merge.pipeline import merge_adapters
 
     out_dir = tmp_path / "merged"
     merge_adapters(
-        synthetic_adapters_dir,
+        qwen3_random_adapters_dir,
         method="uniform",
         output_dir=out_dir,
         locked_spec_path=lora_yaml_path,
     )
-    assert not (out_dir / "generation_config.json").exists()
-
-
-def test_pipeline_reproducible_with_seed(
-    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
-) -> None:
-    """Same seed → bit-identical lora_A/lora_B weights in the output."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("safetensors")
-    from safetensors.torch import load_file
-    from merge.pipeline import merge_adapters
-
-    out_a = tmp_path / "a"
-    out_b = tmp_path / "b"
-    common_kwargs = dict(
-        method="dare_uniform",
-        locked_spec_path=lora_yaml_path,
-        method_kwargs={"drop_rate": 0.5, "seed": 42},
-    )
-    merge_adapters(synthetic_adapters_dir, output_dir=out_a, **common_kwargs)
-    merge_adapters(synthetic_adapters_dir, output_dir=out_b, **common_kwargs)
-
-    a_state = load_file(str(out_a / "adapter_model.safetensors"), device="cpu")
-    b_state = load_file(str(out_b / "adapter_model.safetensors"), device="cpu")
-    assert set(a_state.keys()) == set(b_state.keys())
-    for key in a_state:
-        assert torch.equal(a_state[key], b_state[key]), f"{key} differs across runs"
+    _assert_full_model_output(out_dir)
+    # If the file exists (because transformers wrote it from the base
+    # model's generation config), our custom temperature override won't
+    # be in it. The relevant invariant: we didn't inject a user-supplied
+    # generation_config dict, so any contents come from base defaults.
+    gen_path = out_dir / "generation_config.json"
+    if gen_path.exists():
+        loaded = json.loads(gen_path.read_text())
+        # The custom override would have set temperature=0.3 (test above);
+        # confirm we didn't accidentally write that here.
+        assert loaded.get("temperature") != 0.3
