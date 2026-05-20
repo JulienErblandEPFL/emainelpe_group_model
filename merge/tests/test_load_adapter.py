@@ -283,3 +283,130 @@ def test_load_all_raises_spec_mismatch_when_adapter_diverges(
     msg = str(excinfo.value)
     assert "safety" in msg
     assert "r" in msg
+
+
+# ---------------------------------------------------------------------------
+# GPU-accelerated loading (cluster-only — skipped on CUDA-free laptop)
+# ---------------------------------------------------------------------------
+
+def _skip_unless_cuda() -> None:
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available; GPU loading tests run on cluster only")
+
+
+def test_load_device_cuda_places_tensors_on_cuda(synthetic_adapters_dir: Path) -> None:
+    """``load(device='cuda')`` puts every output tensor on cuda."""
+    _skip_unless_cuda()
+    from merge.load_adapter import load
+
+    tv = load(synthetic_adapters_dir / "math", device="cuda")
+    assert tv, "expected non-empty task vector"
+    for name, tensor in tv.items():
+        assert tensor.device.type == "cuda", f"{name} is on {tensor.device}"
+
+
+def test_load_default_device_remains_cpu(synthetic_adapters_dir: Path) -> None:
+    """Backward-compat: no kwarg → CPU tensors as before."""
+    pytest.importorskip("torch")
+    from merge.load_adapter import load
+
+    tv = load(synthetic_adapters_dir / "math")
+    for name, tensor in tv.items():
+        assert tensor.device.type == "cpu", f"{name} unexpectedly on {tensor.device}"
+
+
+def test_load_all_device_cuda_places_all_domains_on_cuda(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path
+) -> None:
+    """``load_all(device='cuda')`` propagates device to all 4 domains."""
+    _skip_unless_cuda()
+    from merge.load_adapter import load_all
+    from merge.verify_spec import load_locked_spec
+
+    spec = load_locked_spec(lora_yaml_path)
+    tvs = load_all(synthetic_adapters_dir, spec, device="cuda")
+    for domain, tv in tvs.items():
+        for name, tensor in tv.items():
+            assert tensor.device.type == "cuda", (
+                f"{domain}.{name} on {tensor.device}, expected cuda"
+            )
+
+
+def test_load_cpu_and_cuda_produce_equivalent_tensors(
+    synthetic_adapters_dir: Path,
+) -> None:
+    """The materialized ΔW is numerically equivalent on CPU and GPU.
+
+    bf16 precision means we don't expect bit-exact equality, but the
+    matmul should agree within bf16 tolerance.
+    """
+    _skip_unless_cuda()
+    torch = pytest.importorskip("torch")
+    from merge.load_adapter import load
+
+    tv_cpu = load(synthetic_adapters_dir / "math", device="cpu")
+    tv_gpu = load(synthetic_adapters_dir / "math", device="cuda")
+    assert set(tv_cpu.keys()) == set(tv_gpu.keys())
+    for key in tv_cpu:
+        a = tv_cpu[key]
+        b = tv_gpu[key].to("cpu")
+        torch.testing.assert_close(a, b, rtol=1e-2, atol=1e-2)
+
+
+def test_pipeline_cpu_and_cuda_produce_equivalent_output(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path
+) -> None:
+    """CPU and CUDA pipeline runs reconstruct the same ΔW within bf16 tol.
+
+    Direct factor comparison is unsafe — SVD has a sign ambiguity, so two
+    SVDs on numerically-equivalent inputs can produce factor matrices that
+    differ by a sign flip while still yielding the same reconstruction
+    ``(α/r) · B @ A``. The reconstruction is the device-invariant quantity
+    and the one that matters for downstream inference.
+    """
+    _skip_unless_cuda()
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from safetensors.torch import load_file
+    from merge.load_adapter import canonicalize
+    from merge.pipeline import merge_adapters
+    from merge.verify_spec import load_locked_spec
+
+    out_cpu = tmp_path / "cpu"
+    out_gpu = tmp_path / "gpu"
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="uniform",
+        output_dir=out_cpu,
+        locked_spec_path=lora_yaml_path,
+        device="cpu",
+    )
+    merge_adapters(
+        synthetic_adapters_dir,
+        method="uniform",
+        output_dir=out_gpu,
+        locked_spec_path=lora_yaml_path,
+        device="cuda",
+    )
+
+    spec = load_locked_spec(lora_yaml_path)
+    scale = spec["lora_alpha"] / spec["r"]
+
+    a_state = load_file(str(out_cpu / "adapter_model.safetensors"), device="cpu")
+    b_state = load_file(str(out_gpu / "adapter_model.safetensors"), device="cpu")
+    assert set(a_state.keys()) == set(b_state.keys())
+
+    # Pair up lora_A / lora_B per canonical module, compare reconstructions.
+    pairs_a: dict[str, dict[str, torch.Tensor]] = {}
+    pairs_b: dict[str, dict[str, torch.Tensor]] = {}
+    for key in a_state:
+        canon = canonicalize(key)
+        factor = "A" if "lora_A" in key else "B"
+        pairs_a.setdefault(canon, {})[factor] = a_state[key]
+        pairs_b.setdefault(canon, {})[factor] = b_state[key]
+
+    for canon in pairs_a:
+        recon_a = scale * (pairs_a[canon]["B"].float() @ pairs_a[canon]["A"].float())
+        recon_b = scale * (pairs_b[canon]["B"].float() @ pairs_b[canon]["A"].float())
+        torch.testing.assert_close(recon_a, recon_b, rtol=1e-2, atol=1e-2)

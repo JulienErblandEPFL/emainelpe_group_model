@@ -135,6 +135,10 @@ Update this table as stages land. Single source of truth.
 | `eval_all.py` | `evaluate_all_benchmarks`, `evaluate_one_benchmark`, `classify_completion`, `classify_problem_failure` | 5c.1 | **done** |
 | `tests/test_failure_classification.py` | failure taxonomy unit tests | 5c.1 | **done** |
 | `tests/test_eval_io.py` | JSONL parsing + dataclass IO tests | 5c.1 | **done** |
+| `load_adapter.py` | `device=` kwarg on `load` / `load_all` (GPU placement) | 5c.1.5 | **done** |
+| `pipeline.py` | `device=` kwarg + auto-cuda + CPU-at-save | 5c.1.5 | **done** |
+| `../scripts/eval_sweep.py` | one-merge, multi-temperature evaluation CLI | 5c.1.5 | **done** |
+| `tests/test_eval_sweep.py` | argparse + sweep-resilience unit tests | 5c.1.5 | **done** |
 | `publish.py` | `publish_adapter` | 5d | skeleton |
 
 ## Stage 5b: Real-Qwen3 plumbing for AdaMerging
@@ -221,6 +225,57 @@ hierarchical fallback (highest priority first):
 This ensures eval measures what CI would measure for any merged model
 shipping its own `generation_config.json`. The bake-off pipeline writes
 that file per merge config via `pipeline.merge_adapters(..., generation_config=...)`.
+
+## Stage 5c.1.5: Performance + eval-time temperature sweep
+
+### GPU-accelerated adapter loading
+
+`load_adapter.load` and `load_adapter.load_all` take an opt-in `device`
+kwarg (default `"cpu"`). When set to `"cuda"`, safetensors places weights
+directly on GPU and the per-module `(α/r) · B @ A` matmul runs on GPU as
+well. On Qwen3-1.7B adapters this drops the load+materialize time from
+~10 minutes (4 adapters on CPU bf16) to seconds.
+
+`pipeline.merge_adapters` auto-selects the device when its `device`
+argument is `None`: `cuda` when `torch.cuda.is_available()`, otherwise
+`cpu`. The final safetensors save always materializes a contiguous CPU
+copy of every factor — the merged adapter on disk is identical regardless
+of where the merge ran. CPU and GPU paths produce equivalent reconstructed
+`ΔW` up to bf16 tolerance; raw `lora_A` / `lora_B` factors may differ due
+to SVD sign ambiguity, but the reconstruction is invariant.
+
+### Eval-time temperature sweep
+
+Temperature is a sampling-only parameter — it has no effect on the merged
+weights. `scripts/eval_sweep.py` exploits this by merging once and
+evaluating at multiple temperatures in a single run.
+
+```bash
+python -u scripts/eval_sweep.py \
+    --merged-adapter-dir outputs/merged_v1/ \
+    --output-dir outputs/sweep_v1/ \
+    --temperatures 0.3 0.5 0.7
+```
+
+Output layout:
+
+```
+<output_dir>/
+    T_0.3/        # full scorecard + generations + failures per benchmark
+    T_0.5/
+    T_0.7/
+    sweep_results.json    # aggregated comparison, written incrementally
+```
+
+A vLLM crash or OOM on one temperature is recorded to `sweep_results.json`
+as a failed row and the next temperature still runs. Exit codes: `0` =
+all temperatures succeeded, `1` = at least one failed, `2` = setup error.
+
+**Temperature 0.0 is rejected** by `validate_args`. vLLM's `SamplingParams`
+rejects `n>1` when `temperature=0.0` because greedy decoding is
+deterministic; for a deterministic final HF push, build a custom
+`InferenceConfig` with `n=1` directly rather than going through this sweep
+script.
 
 ## Out of scope for `merge/`
 

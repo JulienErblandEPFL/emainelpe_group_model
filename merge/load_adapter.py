@@ -100,13 +100,24 @@ def _which_factor(name: str) -> str:
     return m.group(1)
 
 
-def load(adapter_dir: Path) -> dict[str, torch.Tensor]:
+def load(
+    adapter_dir: Path,
+    device: "str | torch.device" = "cpu",
+) -> dict[str, torch.Tensor]:
     """Load a single PEFT-format LoRA adapter into a task-vector dict.
 
     Materializes ``ΔW = (lora_alpha / r) · B @ A`` for each LoRA-decorated
     module. Output dtype matches what's stored in the safetensors file
     (typically bf16 for our adapters). One entry per canonical
     layer+module identifier.
+
+    Args:
+        adapter_dir: PEFT-format LoRA adapter directory.
+        device: Target device for the loaded tensors and matmul. Default
+            ``"cpu"`` keeps existing behavior. Pass ``"cuda"`` to load
+            safetensors directly to GPU and perform the ``B @ A`` matmul
+            there — on Qwen3-sized adapters this drops load time from
+            ~2.5 min/adapter to seconds.
 
     Raises:
         FileNotFoundError: if ``adapter_config.json`` or
@@ -128,7 +139,10 @@ def load(adapter_dir: Path) -> dict[str, torch.Tensor]:
     alpha = cfg["lora_alpha"]
     scaling = alpha / r
 
-    state = safetensors_load_file(str(weights_path), device="cpu")
+    # safetensors accepts a string device label ("cpu", "cuda", "cuda:0");
+    # torch.device objects are stringified to the same form.
+    device_label = str(device)
+    state = safetensors_load_file(str(weights_path), device=device_label)
 
     # Group factor weights by canonical name → {"A": tensor, "B": tensor}
     pairs: dict[str, dict[str, torch.Tensor]] = {}
@@ -163,11 +177,19 @@ def load_all(
     adapters_dir: Path,
     locked_spec: dict,
     expected_domains: list[str] | None = None,
+    device: "str | torch.device" = "cpu",
 ) -> dict[str, dict[str, torch.Tensor]]:
     """Load all 4 domain adapters from ``adapters_dir`` and verify each.
 
     The directory must contain exactly one subdir per expected domain,
     each in PEFT format. Extra subdirs are an error (strict contract).
+
+    Args:
+        adapters_dir: Parent directory with one subdir per expected domain.
+        locked_spec: Locked-spec dict from :func:`verify_spec.load_locked_spec`.
+        expected_domains: Override the default ``CANONICAL_DOMAINS`` list.
+        device: Target device for the loaded task vectors. Forwarded to
+            :func:`load`. Default ``"cpu"`` preserves legacy behavior.
 
     Raises:
         FileNotFoundError: if a required domain subdir or adapter file is missing.
@@ -211,8 +233,11 @@ def load_all(
     # Second pass: now safe to materialize tensors.
     out: dict[str, dict[str, torch.Tensor]] = {}
     for domain in expected_domains:
-        tv = load(adapters_dir / domain)
+        tv = load(adapters_dir / domain, device=device)
         out[domain] = tv
-        logger.info("Loaded %s: %d task-vector entries, verified ok", domain, len(tv))
+        logger.info(
+            "Loaded %s: %d task-vector entries on %s, verified ok",
+            domain, len(tv), device,
+        )
 
     return out

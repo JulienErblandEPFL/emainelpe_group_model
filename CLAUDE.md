@@ -44,7 +44,10 @@ entirely.
 - `merge/verify_spec.py` — verify an adapter's config against `lora.yaml`
   (8 load-bearing fields, whitelist-based)
 - `merge/load_adapter.py` — load PEFT-format LoRA adapters from a local
-  directory; materializes `ΔW = (α/r) · B @ A`
+  directory; materializes `ΔW = (α/r) · B @ A`. `load()` / `load_all()`
+  accept an optional `device=` kwarg; on the cluster prefer
+  `load_all(adapters_dir, locked_spec, device="cuda")` — drops load time
+  from ~10 min to seconds for the 4-adapter set.
 - `merge/methods/` — `dare`, `uniform_merge`, `weighted_linear_merge`
   (implemented); `ties_merge`, `adamerging` (stubs)
 - `merge/methods/__init__.py` — `METHOD_REGISTRY` dispatches a method-name
@@ -84,7 +87,11 @@ entirely.
   root → Qwen3 defaults).
 - **Runnable scripts** live in `scripts/` at the repo root:
   `fetch_adamerging_data.py` (one-shot HF dataset pre-download),
-  `smoke_adamerging.py` (cluster smoke for the AdaMerging pipeline).
+  `smoke_adamerging.py` (cluster smoke for the AdaMerging pipeline),
+  `eval_sweep.py` (evaluate one merged adapter at multiple sampling
+  temperatures in a single run — temperature is inference-only, so this
+  avoids re-merging; rejects `temperature=0.0` because vLLM forbids
+  `n>1` under greedy decoding).
 
 ## Files to NEVER touch from a coding task
 

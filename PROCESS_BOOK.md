@@ -682,3 +682,89 @@ deleted.
 - **Math v6 in flight**: 200k OMI2 SFT training in parallel. If v6
   lifts above v5 on CI, swap v5 → v6 as the math input before Stage 6
   (milestone push). Otherwise keep v5.
+
+## Day 6 follow-up #2 — 2026-05-20 — Stage 5c.1.5: load() GPU + eval-time temperature sweep
+
+### What happened
+
+Two performance/process fixes ahead of the bake-off:
+
+1. **GPU-accelerated adapter loading.** On the first cluster smoke of
+   Stage 5c.1, `merge.load_adapter.load_all` ran on CPU bf16 and took
+   ~10 min for the 4-adapter set (196 small matmuls per adapter, all
+   on CPU). Added an opt-in `device` kwarg to `load`, `load_all`, and
+   `pipeline.merge_adapters`. Default remains `"cpu"`; `merge_adapters`
+   auto-selects `"cuda"` when available. The final safetensors save
+   materializes contiguous CPU tensors regardless of where the merge
+   ran, so the on-disk artifact is identical to the CPU path.
+2. **Eval-time temperature sweep.** Realized late on Day 6 that
+   `temperature` is sampling-only — it changes nothing about the
+   merged weights. The original bake-off plan (re-merge for each of
+   `{0.0, 0.3, 0.5, 0.7}`) wasted 3 of 4 merges. Created
+   `scripts/eval_sweep.py` which takes a single merged adapter and a
+   list of temperatures, runs `evaluate_all_benchmarks` per temperature
+   with explicit `InferenceConfig` overrides, and writes
+   `T_<temp>/` subdirs + an incremental `sweep_results.json`.
+   `temperature=0.0` is rejected at the CLI: vLLM forbids `n>1` under
+   greedy decoding, and the bake-off needs `n=8` for pass@8.
+
+### Decisions & rationale
+
+- **Device defaults `"cpu"` everywhere, auto-cuda only in the
+  pipeline.** The library functions are the API surface other code
+  imports; defaulting them to GPU would surprise the laptop test
+  suite. The pipeline is a top-level orchestrator — it can safely
+  auto-select cuda.
+- **Save always on CPU.** safetensors refuses non-contiguous tensors,
+  and SVD factor outputs are views. A single `.detach().to("cpu").contiguous()`
+  pass before save handles both concerns and decouples the on-disk
+  format from the compute device.
+- **CPU/GPU parity assertion: compare reconstructed ΔW, not raw
+  factors.** SVD has a sign ambiguity (`U → -U, Vᵀ → -Vᵀ` is the same
+  reconstruction). A factor-by-factor tolerance test can spuriously
+  fail when the two devices' SVD routines pick different signs. The
+  device-invariant quantity is the reconstruction; that's what the
+  test asserts.
+- **Sweep resilience instead of fail-fast.** A vLLM OOM on one
+  temperature should not abort the sweep — the other temperatures
+  may still complete and inform the bake-off. The script catches per
+  temperature, records the traceback to the result row, writes
+  incrementally, and continues. Exit codes: `0` all-ok, `1` any-failed,
+  `2` setup error.
+- **Injectable callables, not a class.** `run_sweep(args, eval_callable,
+  config_factory)` takes the two ML-dependent pieces as parameters.
+  Production wiring lives in `_default_eval_callable` and
+  `_default_config_factory`, which lazily import torch/vLLM. The test
+  suite injects `types.SimpleNamespace`-based stubs and stays
+  torch-free.
+- **Dropped `temperature=0.0` from the bake-off entirely.** Deterministic
+  greedy decoding is a separate concern (final HF push with `n=1`); it
+  doesn't belong in a pass@8 sweep. `validate_args` rejects it with a
+  message that explains why and points to the alternative.
+
+### Verified (laptop)
+
+- `pytest merge/tests/test_eval_sweep.py -v` — 21 passed, 0 failed.
+- `pytest merge/tests/ -v` — 102 passed, 104 skipped (all skips are
+  `pytest.importorskip("torch")` gates as expected on a torch-free
+  laptop).
+- `python3 scripts/eval_sweep.py --help` — renders the full argparse
+  surface without touching torch or vLLM.
+- `python3 scripts/eval_sweep.py --merged-adapter-dir /tmp/does-not-exist
+  --output-dir /tmp/x --temperatures 0.0 0.5` — exits 2 and prints
+  both the missing-dir error and the temperature=0.0 rejection in one
+  shot (validation reports every error, not just the first).
+
+### Verified (cluster)
+
+- *To fill in after the next `runai submit`: confirm
+  `load_all(adapters_dir, locked_spec, device="cuda")` cuts wall-clock
+  load time from ~10 min to seconds on the 4-adapter set; confirm
+  `scripts/eval_sweep.py --temperatures 0.3 0.5 0.7` produces three
+  scorecards and an aggregated `sweep_results.json` from one merge.*
+
+### Open questions
+
+- None blocking. If a temperature consistently OOMs at the project's
+  max-tokens setting, we may want a per-temperature `max_tokens`
+  override on the sweep CLI — defer until we see it happen.

@@ -99,6 +99,7 @@ def merge_adapters(
     locked_spec_path: Path | None = None,
     method_kwargs: dict[str, Any] | None = None,
     generation_config: dict[str, Any] | None = None,
+    device: str | None = None,
 ) -> Path:
     """Run the full merge pipeline and write a PEFT-loadable adapter directory.
 
@@ -125,6 +126,10 @@ def merge_adapters(
             :func:`merge.generation_config.make_generation_config` to
             construct). If ``None``, no ``generation_config.json`` is
             written.
+        device: Compute device for loading + merging. ``None`` (default)
+            auto-selects ``"cuda"`` when ``torch.cuda.is_available()``,
+            otherwise ``"cpu"``. The final safetensors save always runs
+            from CPU tensors regardless of this choice.
 
     Returns:
         The ``output_dir`` path (now populated with ``adapter_config.json``,
@@ -143,6 +148,7 @@ def merge_adapters(
     # Lazy: safetensors is only needed at the save step. Importing it at
     # module level would force the laptop's torch-free environment to fail
     # at import time, defeating the lazy-import pattern from Stage 2.
+    import torch
     from safetensors.torch import save_file as safetensors_save_file
 
     if method not in METHOD_REGISTRY:
@@ -158,8 +164,12 @@ def merge_adapters(
 
     _ensure_empty_output_dir(output_dir)
 
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("merge_adapters using device=%s", device)
+
     # load_all verifies each adapter against locked_spec and raises on mismatch.
-    adapters_by_domain = load_all(adapters_dir, locked_spec)
+    adapters_by_domain = load_all(adapters_dir, locked_spec, device=device)
     task_vectors = list(adapters_by_domain.values())  # canonical-order list
     logger.info(
         "Loaded %d adapters for merge (domains=%s, method=%s)",
@@ -181,7 +191,9 @@ def merge_adapters(
     # mid-run failure leave only the safetensors file (clearly broken).
     # safetensors refuses to save non-contiguous tensors (views, slices, broadcasts).
     # SVD factorization in svd_factor() produces views; force a copy here.
-    peft_state = {k: v.contiguous() for k, v in peft_state.items()}
+    # When device != cpu, .to("cpu") materializes a CPU copy; safetensors then
+    # gets contiguous CPU tensors regardless of where the merge ran.
+    peft_state = {k: v.detach().to("cpu").contiguous() for k, v in peft_state.items()}
     safetensors_save_file(peft_state, str(output_dir / "adapter_model.safetensors"))
 
     # The four adapters are byte-identical on the 8 load-bearing fields; using
