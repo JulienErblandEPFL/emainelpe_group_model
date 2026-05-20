@@ -166,6 +166,8 @@ Update this table as stages land. Single source of truth.
 | `pipeline.py` | `device=` kwarg + auto-cuda + CPU-at-save | 5c.1.5 | **done** |
 | `../scripts/eval_sweep.py` | one-merge, multi-temperature evaluation CLI | 5c.1.5 | **done** |
 | `tests/test_eval_sweep.py` | argparse + sweep-resilience unit tests | 5c.1.5 | **done** |
+| `../scripts/run_bakeoff.py` | 4 methods × 3 temperatures orchestrator | 5c.2 | **done** |
+| `tests/test_run_bakeoff.py` | argparse + resilience + winner-pick unit tests | 5c.2 | **done** |
 | `publish.py` | `publish_adapter` | 5d | skeleton |
 
 ## Stage 5b: Real-Qwen3 plumbing for AdaMerging
@@ -307,6 +309,65 @@ rejects `n>1` when `temperature=0.0` because greedy decoding is
 deterministic; for a deterministic final HF push, build a custom
 `InferenceConfig` with `n=1` directly rather than going through this sweep
 script.
+
+## Stage 5c.2: Full bake-off
+
+`scripts/run_bakeoff.py` orchestrates the milestone-day comparison: 4
+merge methods × 3 sampling temperatures on the same 4 input adapters, in
+one run. Merge once per method, sweep temperatures on that merge — 4
+merges + 12 evals total (not 12 merges).
+
+```bash
+nohup python -u scripts/run_bakeoff.py \
+    --adapters-dir loras/ \
+    --output-dir bakeoff_2026-05-21-1400/ \
+    > bakeoff.log 2>&1 &
+```
+
+Methods swept (fixed list): `uniform`, `dare_uniform`, `dare_adamerging`,
+`ties`. Temperatures (fixed list): `0.3, 0.5, 0.7`. Override either with
+`--methods` / `--temperatures` for partial sweeps.
+
+Output layout:
+
+```
+<output_dir>/
+    bakeoff_results.json      # aggregated, written incrementally per method
+    uniform/
+        merged/               # config.json + model.safetensors + ...
+        sweep/T_0.3/          # full scorecard + generations + failures
+        sweep/T_0.5/
+        sweep/T_0.7/
+    dare_uniform/
+        merged/
+        sweep/T_0.3/ ...
+    dare_adamerging/
+        merged/
+        sweep/T_0.3/ ...
+    ties/
+        merged/
+        sweep/T_0.3/ ...
+```
+
+**Resilience.** A merge failure marks that method's 3 temperature slots
+all-failed and moves to the next method. A single temperature OOM marks
+only that slot failed; the other 2 temperatures continue. Partial
+bake-off data is preserved by incremental writes after each method
+completes (or fails).
+
+**Hard-fail gates at startup.** Missing adapter dir, missing
+`validation_samples/*.jsonl`, invalid CLI arg, or any adapter failing
+locked-spec verification → exit code 2 without launching any GPU work.
+
+**AdaMerging hyperparameters are NOT swept.** The bake-off uses a single
+fixed config (drop_rate=0.5, lr=1e-2, lambda_l2=1e-4, max_steps=200,
+early_stop_patience=100, batch_size=2). Hyperparameter tuning is a
+separate experiment. `--adamerging-max-steps` overrides the step count
+if needed.
+
+**Winner selection.** End-of-run console summary prints a (method,
+temperature) × benchmark grid plus a `Winner: <method> @ T=<temp>` line
+identifying the highest average pass@8 across the 4 benchmarks.
 
 ## Out of scope for `merge/`
 

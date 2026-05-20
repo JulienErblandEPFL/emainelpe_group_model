@@ -979,3 +979,134 @@ that compounded into 4 test failures and 3 spurious OOMs.
   via a cheap `if method not in METHOD_REGISTRY` guard before
   `load_all` — without removing the in-try check that the test relies
   on.
+
+
+## Day 8 — 2026-05-20 — Stage 5c.2: Full bake-off orchestration
+
+### What happened
+
+Built `scripts/run_bakeoff.py` to orchestrate the milestone-day method
+comparison: 4 merge methods × 3 sampling temperatures = 12 evaluation
+scorecards on the same 4 input adapters, in one run, with an aggregated
+`bakeoff_results.json` at the top level.
+
+### Decisions and rationale
+
+- **Merge once per method, sweep temperatures on that merge.**
+  Temperature is sampling-only — it has no effect on merged weights.
+  4 merges + 12 evals (not 12 merges) cuts ~3-4 hours of redundant
+  work. Mirrors the Day 6 follow-up #2 insight that motivated
+  `eval_sweep.py`.
+
+- **Methods locked to `[uniform, dare_uniform, dare_adamerging, ties]`.**
+  Four methods we have implemented end-to-end (Stages 3, 4, 5a). Skip
+  `adamerging` standalone (composition with DARE is the experimentally
+  motivated path per the AdaMerging paper) and `dare_weighted`
+  (per-task weights are tunable hyperparameters that belong in a
+  separate weighted-DARE sweep, not the headline comparison).
+
+- **Temperatures `[0.3, 0.5, 0.7]`.** Locked from Day 6 follow-up #2.
+  Greedy (0.0) is excluded by vLLM's `n>1` constraint.
+
+- **AdaMerging hyperparameters: single bake-off config, not swept.**
+  `drop_rate=0.5, lr=1e-2, lambda_l2=1e-4, max_steps=200,
+  early_stop_patience=100, batch_size=2`. Tuning these is a separate
+  experiment (a "hyperparameter sweep" that would be 4-8x more runs).
+  For the bake-off we want methods-vs-methods, not method-vs-itself.
+  `--adamerging-max-steps` is the one knob exposed because 200 is the
+  bake-off budget compromise (vs production ~1000) — overridable
+  without touching the script if cluster wall-clock allows.
+
+- **Per-(method, temperature) failure isolation.** A failed merge
+  marks that method's 3 temperature slots all-failed and continues to
+  the next method. A single temperature OOM marks only that slot.
+  Bake-off is ~3.5-4 hours; we don't want one OOM at hour 2 to lose
+  the other 11 runs' data. Incremental writes to
+  `bakeoff_results.json` after each method completes give us
+  durability — crashing 3 hours in still leaves 2 hours' worth on
+  disk.
+
+- **Hard-fail at startup if any input adapter is missing or fails
+  locked-spec verification.** `verify_spec` runs on all 4 adapter
+  configs BEFORE any GPU work starts. A 4-hour bake-off that crashes
+  because of a typo'd adapter directory is wasteful in a way that an
+  early-fail check eliminates for free.
+
+- **Injectable callables for testability.** Same pattern as
+  `eval_sweep.py`: `run_bakeoff(args, merge_callable, eval_callable,
+  config_factory, adamerging_state)` takes the three ML-dependent
+  pieces as parameters. Production wiring calls
+  `_default_merge_callable` / `_default_eval_callable` /
+  `_default_config_factory`, which lazily import torch/peft/vllm.
+  Tests inject `types.SimpleNamespace`-based stubs and stay
+  torch-free.
+
+- **AdaMerging forward_fn + data_iter built ONCE at startup.** Builds
+  before the method loop only if `dare_adamerging` is in `--methods`.
+  Cleanup happens at the end via the `cleanup()` returned by
+  `make_qwen3_forward`, in a finally block so an unexpected
+  exception still releases GPU. Memory cost: ~3.4 GB for the
+  Qwen3 forward base plus the in-merge base load during
+  `pipeline.merge_adapters` — that's 2× base in GPU for the duration
+  of the dare_adamerging merge step (~7 GB), well within A100-40g.
+
+- **Default output dir: `<repo_root>/bakeoff_<YYYY-MM-DD-HHMM>/`.**
+  Under the repo root, which on cluster is `/scratch/Group/...`
+  (persistent), not `/tmp/` (ephemeral and small). Timestamped so
+  back-to-back runs don't collide.
+
+- **Winner: highest average pass@8 across the 4 benchmarks.** Single
+  scalar makes for an unambiguous comparison. The grid output shows
+  per-benchmark pass@1 / pass@8 so a reviewer can inspect any
+  unbalanced result (e.g. a method that wins overall by sacrificing
+  one domain).
+
+### Implementation
+
+- `scripts/run_bakeoff.py` — 4 dataclasses (`TemperatureRunRow`,
+  `MethodRunRow`, `BakeoffPayload`, plus the existing `InferenceConfig`
+  in `merge.infer`). `validate_args` mirrors `eval_sweep.py` plus
+  adapter-dir / methods / adamerging-max-steps checks.
+  `verify_locked_specs` runs `merge.verify_spec.verify` on each of
+  the 4 adapter configs. `build_method_kwargs` returns the
+  per-method kwarg dict — including the AdaMerging state when
+  applicable. `run_bakeoff` is the injectable core; `main` wires up
+  the production callables and the AdaMerging cleanup in a finally.
+- `merge/tests/test_run_bakeoff.py` — 36 unit tests, all torch-free.
+  Covers argparse validation, spec verification, kwargs construction,
+  dataclass JSON round-trip, result aggregation, winner selection,
+  the happy path with stubs, incremental writes after each method,
+  per-method merge resilience, per-temperature eval resilience, the
+  no-state dare_adamerging failure path, and the print_summary smoke.
+
+### Verified (laptop)
+
+- `pytest merge/tests/test_run_bakeoff.py -v` — **36 passed, 0
+  failed** in <1s on the torch-free laptop.
+- `python3 scripts/run_bakeoff.py --help` renders the full argparse
+  surface plus the recommended `nohup` launch pattern.
+- Full merge suite: `pytest merge/tests/ -v` — 139 passed, 97 skipped
+  (skips are torch/CUDA/Qwen3-gated tests; pattern unchanged from
+  Day 7 follow-up).
+
+### Verified (cluster)
+
+- *To fill in after the next `runai submit`: confirm the full bake-off
+  (4 methods × 3 temperatures) completes end-to-end on real teammate
+  adapters; confirm per-(method, temperature) failure isolation works
+  under a real OOM; confirm the output layout matches the README
+  spec.*
+
+### Open questions / follow-ups
+
+- Bake-off wall-clock budget: 4 merges × ~5 min + 12 evals × ~15 min
+  ≈ 3.5 hours on A100-40g. If `dare_adamerging` with `--adamerging-max-steps
+  200` over-runs, drop to 100 (`/2`) or 50 (`/4`). If it underfits,
+  bump to 500 — but that pushes into 4+ hour territory.
+- Should the bake-off auto-publish the winner to HF (`group_model`
+  repo)? Defer to Stage 5d (`publish.py`); the bake-off should leave
+  the winner identification and human-in-loop confirmation step
+  intact.
+- A "second-place" report (winner + 95% CI band on avg pass@8) would
+  be useful for the final report. Out of scope here; can be added on
+  top of `bakeoff_results.json` after the cluster smoke.

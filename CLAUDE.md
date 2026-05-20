@@ -102,7 +102,12 @@ entirely.
   `eval_sweep.py` (evaluate one merged adapter at multiple sampling
   temperatures in a single run — temperature is inference-only, so this
   avoids re-merging; rejects `temperature=0.0` because vLLM forbids
-  `n>1` under greedy decoding).
+  `n>1` under greedy decoding),
+  `run_bakeoff.py` (Stage 5c.2: sweep 4 methods × 3 temperatures on the
+  same input adapters in one orchestrated run; ~3.5-4 hours on cluster;
+  outputs aggregated `bakeoff_results.json` + per-(method, temperature)
+  eval subdirs; per-(method, temperature) failures isolated). Launch:
+  `nohup python -u scripts/run_bakeoff.py --adapters-dir loras/ --output-dir bakeoff_<date>/ > bakeoff.log 2>&1 &`.
 
 ## Files to NEVER touch from a coding task
 
