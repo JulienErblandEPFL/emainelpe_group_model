@@ -388,3 +388,203 @@ def test_adamerging_raises_on_mismatched_keys(
             data_iter=iter([]),
             max_steps=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Metrics persistence (follow-up #6)
+# ---------------------------------------------------------------------------
+
+def _fake_adamerging_result():
+    """Build a minimal AdaMergingResult; used to mock the heavy adamerging()
+    call so metrics-persistence tests stay CPU-light and torch-only."""
+    torch = pytest.importorskip("torch")
+    from merge.methods.adamerging import AdaMergingResult
+
+    # 4 tasks × 3 layers — small but row-/column-distinct so order bugs surface.
+    coeffs = torch.tensor(
+        [
+            [0.10, 0.11, 0.12],   # task 0
+            [0.20, 0.21, 0.22],   # task 1
+            [0.30, 0.31, 0.32],   # task 2
+            [0.40, 0.41, 0.42],   # task 3
+        ],
+        dtype=torch.float32,
+    )
+    merged = {
+        "model.layers.0.self_attn.q_proj": torch.zeros(2, 2),
+        "model.layers.1.mlp.down_proj": torch.zeros(2, 2),
+        "model.layers.2.self_attn.k_proj": torch.zeros(2, 2),
+    }
+    return AdaMergingResult(
+        merged=merged,
+        coefficients=coeffs,
+        loss_history=[1.0, 0.5, 0.25, 0.125],
+        steps_run=4,
+        early_stopped=True,
+    )
+
+
+def test_dare_adamerging_persists_metrics_when_path_provided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dare_adamerging writes adamerging_metrics.json with the expected schema
+    when metrics_out_path + task_names are provided. task_names row order
+    is preserved verbatim from caller (this is the row-label invariant the
+    pipeline relies on)."""
+    pytest.importorskip("torch")
+    import json
+    import torch
+
+    import merge.methods as methods_mod
+    from merge.methods import dare_adamerging
+
+    fake = _fake_adamerging_result()
+    monkeypatch.setattr(methods_mod, "adamerging", lambda *a, **k: fake)
+
+    # task_vectors shape/keys must match the merged dict so DARE's per-tv
+    # loop and the (unused) merge step don't blow up before we hit the
+    # patched adamerging() call.
+    tv = {k: torch.ones_like(v) for k, v in fake.merged.items()}
+    task_vectors = [tv, {**tv}, {**tv}, {**tv}]
+
+    out_path = tmp_path / "adamerging_metrics.json"
+    task_names = ["math", "general_knowledge", "safety", "multilingual"]
+
+    merged = dare_adamerging(
+        task_vectors,
+        forward_fn=lambda m, b: None,
+        data_iter=iter([]),
+        drop_rate=0.5,
+        seed=42,
+        max_steps=4,
+        metrics_out_path=out_path,
+        task_names=task_names,
+    )
+
+    assert isinstance(merged, dict)
+    assert out_path.exists(), "metrics file was not written"
+    payload = json.loads(out_path.read_text())
+    assert payload["task_names"] == task_names
+    assert payload["n_tasks"] == 4
+    assert payload["n_layers"] == 3
+    assert payload["steps_run"] == 4
+    assert payload["early_stopped"] is True
+    assert payload["loss_history"] == [1.0, 0.5, 0.25, 0.125]
+    assert len(payload["coefficients"]) == 4
+    assert len(payload["coefficients"][0]) == 3
+    # Row 2 corresponds to "safety" — the value in that row is the giveaway.
+    assert payload["coefficients"][2][0] == pytest.approx(0.30, abs=1e-6)
+    hp = payload["hyperparams"]
+    assert hp["method"] == "dare_adamerging"
+    assert hp["drop_rate"] == 0.5
+    assert hp["seed"] == 42
+    assert hp["max_steps"] == 4
+
+
+def test_dare_adamerging_no_metrics_when_path_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No file is written when metrics_out_path is None (back-compat path
+    for the existing test_dare_adamerging_composition contract)."""
+    pytest.importorskip("torch")
+    import torch
+
+    import merge.methods as methods_mod
+    from merge.methods import dare_adamerging
+
+    fake = _fake_adamerging_result()
+    monkeypatch.setattr(methods_mod, "adamerging", lambda *a, **k: fake)
+
+    tv = {k: torch.ones_like(v) for k, v in fake.merged.items()}
+    task_vectors = [tv, {**tv}, {**tv}, {**tv}]
+
+    dare_adamerging(
+        task_vectors,
+        forward_fn=lambda m, b: None,
+        data_iter=iter([]),
+        drop_rate=0.5,
+        seed=42,
+        max_steps=4,
+    )
+    # tmp_path stays empty — nothing was written.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_dare_adamerging_metrics_requires_task_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without task_names the coefficient rows would be unlabeled — refuse."""
+    pytest.importorskip("torch")
+    import torch
+
+    import merge.methods as methods_mod
+    from merge.methods import dare_adamerging
+
+    fake = _fake_adamerging_result()
+    monkeypatch.setattr(methods_mod, "adamerging", lambda *a, **k: fake)
+
+    tv = {k: torch.ones_like(v) for k, v in fake.merged.items()}
+    task_vectors = [tv, {**tv}, {**tv}, {**tv}]
+
+    with pytest.raises(ValueError, match="task_names is required"):
+        dare_adamerging(
+            task_vectors,
+            forward_fn=lambda m, b: None,
+            data_iter=iter([]),
+            drop_rate=0.5,
+            seed=42,
+            max_steps=4,
+            metrics_out_path=tmp_path / "metrics.json",
+            task_names=None,
+        )
+
+
+def test_adamerging_registry_shim_persists_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bare ``adamerging`` registry entry (no DARE) also persists metrics."""
+    pytest.importorskip("torch")
+    import json
+
+    import merge.methods as methods_mod
+    from merge.methods import METHOD_REGISTRY
+
+    fake = _fake_adamerging_result()
+    monkeypatch.setattr(methods_mod, "adamerging", lambda *a, **k: fake)
+
+    out_path = tmp_path / "adamerging_metrics.json"
+    task_names = ["math", "general_knowledge", "safety", "multilingual"]
+
+    merged = METHOD_REGISTRY["adamerging"](
+        [fake.merged] * 4,  # any 4-element list — adamerging() is mocked
+        forward_fn=lambda m, b: None,
+        data_iter=iter([]),
+        metrics_out_path=out_path,
+        task_names=task_names,
+    )
+
+    assert isinstance(merged, dict)
+    payload = json.loads(out_path.read_text())
+    assert payload["task_names"] == task_names
+    assert payload["hyperparams"]["method"] == "adamerging"
+    # forward_fn / data_iter must NOT leak into the hyperparams snapshot —
+    # they're non-serializable callables/iterators.
+    assert "forward_fn" not in payload["hyperparams"]
+    assert "data_iter" not in payload["hyperparams"]
+
+
+def test_persist_adamerging_metrics_rejects_task_name_length_mismatch(
+    tmp_path: Path,
+) -> None:
+    """Mismatched task_names length would silently mislabel rows — refuse."""
+    pytest.importorskip("torch")
+    from merge.methods import _persist_adamerging_metrics
+
+    fake = _fake_adamerging_result()
+    with pytest.raises(ValueError, match="row order would be ambiguous"):
+        _persist_adamerging_metrics(
+            fake,
+            tmp_path / "metrics.json",
+            task_names=["only", "three", "names"],  # but coefficients has 4 rows
+            hyperparams={},
+        )

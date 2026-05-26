@@ -25,12 +25,14 @@ Stage 5a implementation.
 """
 from __future__ import annotations
 
+import json
 import logging
-from typing import Callable
+from pathlib import Path
+from typing import Any, Callable
 
 import torch
 
-from .adamerging import adamerging
+from .adamerging import AdaMergingResult, adamerging
 from .dare import dare
 from .ties import ties_merge
 from .uniform import uniform_merge
@@ -38,6 +40,48 @@ from .weighted_linear import weighted_linear_merge
 
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_adamerging_metrics(
+    result: AdaMergingResult,
+    metrics_out_path: Path,
+    task_names: list[str],
+    hyperparams: dict[str, Any],
+) -> None:
+    """Write the AdaMergingResult metrics that the pipeline would otherwise discard.
+
+    ``coefficients`` has shape ``[N_tasks, N_layers]``; row ``i`` corresponds
+    to ``task_names[i]``. ``task_names`` MUST be in the same order as the
+    task_vectors list passed to :func:`adamerging` (the pipeline derives it
+    from ``list(adapters_by_domain.keys())``, which is also the order of
+    ``list(adapters_by_domain.values())`` used to build the task_vectors).
+    """
+    coeffs = result.coefficients.detach().cpu().tolist()
+    n_tasks = len(coeffs)
+    n_layers = len(coeffs[0]) if coeffs else 0
+    if n_tasks != len(task_names):
+        raise ValueError(
+            f"task_names length ({len(task_names)}) does not match coefficients "
+            f"first dim ({n_tasks}); row order would be ambiguous."
+        )
+    payload = {
+        "task_names": list(task_names),
+        "n_tasks": n_tasks,
+        "n_layers": n_layers,
+        "steps_run": result.steps_run,
+        "early_stopped": result.early_stopped,
+        "loss_history": list(result.loss_history),
+        "coefficients": coeffs,
+        "hyperparams": dict(hyperparams),
+    }
+    metrics_out_path = Path(metrics_out_path)
+    metrics_out_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_out_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+    logger.info(
+        "adamerging metrics persisted to %s (%d tasks × %d layers, %d steps)",
+        metrics_out_path, n_tasks, n_layers, result.steps_run,
+    )
 
 
 def dare_uniform(
@@ -127,6 +171,8 @@ def dare_adamerging(
     max_steps: int = 1000,
     early_stop_patience: int = 100,
     progress_log_every: int = 50,
+    metrics_out_path: Path | str | None = None,
+    task_names: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compose DARE + AdaMerging.
 
@@ -184,10 +230,39 @@ def dare_adamerging(
         "dare_adamerging finished: %d steps, early_stopped=%s, final_loss=%.4f",
         result.steps_run, result.early_stopped, final_loss,
     )
+
+    if metrics_out_path is not None:
+        if task_names is None:
+            raise ValueError(
+                "metrics_out_path was supplied without task_names; "
+                "task_names is required to label coefficient rows."
+            )
+        _persist_adamerging_metrics(
+            result,
+            Path(metrics_out_path),
+            task_names,
+            hyperparams={
+                "method": "dare_adamerging",
+                "drop_rate": drop_rate,
+                "seed": seed,
+                "rescale": rescale,
+                "init_coefficient": init_coefficient,
+                "lr": lr,
+                "lambda_l2": lambda_l2,
+                "max_steps": max_steps,
+                "early_stop_patience": early_stop_patience,
+            },
+        )
+
     return result.merged
 
 
-def _adamerging_dict(*args, **kwargs) -> dict[str, torch.Tensor]:
+def _adamerging_dict(
+    *args,
+    metrics_out_path: Path | str | None = None,
+    task_names: list[str] | None = None,
+    **kwargs,
+) -> dict[str, torch.Tensor]:
     """Registry-facing thin wrapper around :func:`adamerging`.
 
     The native :func:`adamerging` returns :class:`AdaMergingResult` (so
@@ -195,8 +270,29 @@ def _adamerging_dict(*args, **kwargs) -> dict[str, torch.Tensor]:
     pipeline orchestrator iterates ``merged.items()``, so the registry
     entry must yield a dict. This wrapper extracts ``.merged`` and
     forwards every argument verbatim.
+
+    When ``metrics_out_path`` is provided, the AdaMergingResult metrics
+    that the dict-return contract would otherwise discard (coefficients,
+    loss history, step count, early-stop flag) are persisted to that
+    path as JSON. ``task_names`` is required in that case so coefficient
+    rows can be labeled.
     """
     result = adamerging(*args, **kwargs)
+    if metrics_out_path is not None:
+        if task_names is None:
+            raise ValueError(
+                "metrics_out_path was supplied without task_names; "
+                "task_names is required to label coefficient rows."
+            )
+        _persist_adamerging_metrics(
+            result,
+            Path(metrics_out_path),
+            task_names,
+            hyperparams={"method": "adamerging", **{
+                k: v for k, v in kwargs.items()
+                if k not in {"forward_fn", "data_iter"}
+            }},
+        )
     return result.merged
 
 

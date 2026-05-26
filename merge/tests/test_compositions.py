@@ -53,10 +53,15 @@ def test_dare_uniform_reproducible_with_seed(
     from merge.verify_spec import load_locked_spec
 
     spec = load_locked_spec(lora_yaml_path)
-    tvs = list(load_all(synthetic_adapters_dir, spec).values())
-
-    a = dare_uniform(tvs, drop_rate=0.5, seed=42)
-    b = dare_uniform(tvs, drop_rate=0.5, seed=42)
+    # Load tvs fresh each call. dare_uniform applies DARE in-place to
+    # save GPU memory (see merge/methods/__init__.py), so re-using the
+    # same dict object would feed already-masked inputs into the second
+    # call. The pipeline always passes fresh load_all outputs to the
+    # merge_fn — this test matches that flow.
+    tvs_a = list(load_all(synthetic_adapters_dir, spec).values())
+    a = dare_uniform(tvs_a, drop_rate=0.5, seed=42)
+    tvs_b = list(load_all(synthetic_adapters_dir, spec).values())
+    b = dare_uniform(tvs_b, drop_rate=0.5, seed=42)
     for key in a:
         assert torch.equal(a[key], b[key]), f"{key} differs across seed=42 calls"
 
@@ -114,10 +119,12 @@ def test_dare_weighted_reproducible_with_seed(
     from merge.verify_spec import load_locked_spec
 
     spec = load_locked_spec(lora_yaml_path)
-    tvs = list(load_all(synthetic_adapters_dir, spec).values())
-
-    a = dare_weighted(tvs, [0.4, 0.3, 0.2, 0.1], drop_rate=0.5, seed=7)
-    b = dare_weighted(tvs, [0.4, 0.3, 0.2, 0.1], drop_rate=0.5, seed=7)
+    # See dare_uniform reproducibility test: fresh load per call because
+    # dare_weighted applies DARE in place.
+    tvs_a = list(load_all(synthetic_adapters_dir, spec).values())
+    a = dare_weighted(tvs_a, [0.4, 0.3, 0.2, 0.1], drop_rate=0.5, seed=7)
+    tvs_b = list(load_all(synthetic_adapters_dir, spec).values())
+    b = dare_weighted(tvs_b, [0.4, 0.3, 0.2, 0.1], drop_rate=0.5, seed=7)
     for key in a:
         assert torch.equal(a[key], b[key]), f"{key} differs across seed=7 calls"
 

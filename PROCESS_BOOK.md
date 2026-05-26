@@ -1574,3 +1574,305 @@ would only matter if 4 task vectors alone exceeded the budget.
 Same as follow-up #3: `dare_uniform` and `dare_adamerging` can be
 re-run on the cluster to complete the 4-method comparison for the
 final report. The ties @ T=0.5 winner stands.
+
+---
+
+## Day 8 follow-up #5 (2026-05-26) — full 4-method bake-off + pass@1 vs pass@8 metric mismatch
+
+### What ran
+
+After follow-ups #3 (bf16 mask) and #4 (in-place DARE), `dare_uniform`
+and `dare_adamerging` both completed cleanly on the cluster. We now
+have the full 4-method × 3-temperature grid:
+
+- `bakeoff_20260526_1145/` — uniform, ties (pre-DARE-fix run)
+- `bakeoff_dare_20260526_1246/` — dare_uniform, dare_adamerging
+  (post-fix re-run on the same input adapters)
+
+Peak GPU dropped from ~25-30 GB to ~12-13 GB on the DARE leg, and
+`dare_adamerging`'s forward_fn coexisted with the merge step and was
+released cleanly afterwards (logged: freed 3.44 GB at teardown). No
+OOM on a clean 40 GB A100. The two follow-ups closed the GPU budget
+problem.
+
+### Bake-off "Winner" — and what it actually measured
+
+`scripts/run_bakeoff.select_winner` ranks configs by **average pass@8
+across all 4 benchmarks**. By that metric:
+
+- Winner: **ties @ T=0.5, avg pass@8 = 0.700**
+
+That is the model that got published via `scripts/publish.py` to
+`cs-552-2026-emainelpe/group_model`, with `generation_config.json`
+rewritten to bundle `temperature=0.5, top_p=0.8, top_k=20`.
+
+### The metric mismatch (discovered post-publish)
+
+The course CI does NOT grade on avg pass@8. It grades:
+
+- math → **pass@8**
+- general_knowledge, safety, multilingual → **pass@1**
+
+So the bake-off optimized one metric and the leaderboard scores a
+different one. Re-ranking the same scorecards on a (presumed
+equal-weight) average of `math.pass@8 + gen/safety/mult.pass@1`
+reshuffles the top of the table.
+
+**Point estimates on the CI-shaped metric** (transcribed from the
+session that produced the bake-off; **NOT independently
+recomputed on this laptop — the bakeoff dirs live on the cluster**;
+to be confirmed against `scorecard.json` before any redeployment
+decision):
+
+| method            | T   | CI-metric (point estimate) |
+|-------------------|-----|----------------------------|
+| dare_adamerging   | 0.5 | ~0.519                     |
+| dare_uniform      | 0.3 | ~0.509                     |
+| dare_adamerging   | 0.3 | ~0.503                     |
+| uniform           | 0.5 | ~0.497                     |
+| **ties** (published) | 0.5 | ~0.497                  |
+
+i.e. the model on the Hub is roughly 4th/5th on the CI-shaped metric,
+not 1st.
+
+### Why this is NOT a clean "republish dare_adamerging" call
+
+Three reasons, all of which need to be in the entry honestly:
+
+1. **The CI aggregation is unconfirmed.** The numbers above assume
+   equal-weight average of the 4 per-benchmark scores. The course CI
+   may weight benchmarks differently, sum instead of average, or use a
+   slightly different per-benchmark metric. Until we read the grader,
+   the re-ranking is an estimate, not a fact.
+2. **n=10 problems per benchmark.** The top ~5 configs span
+   ~0.497-0.519 — a spread of about 0.022, i.e. 3-4 problems total
+   across the four benchmarks. That is well inside sampling noise at
+   n=10. The configs are statistically indistinguishable on this
+   validation set. Choosing dare_adamerging over ties on a 0.022
+   point-estimate lead would be selecting on noise.
+3. **The current published model already passed the dry-run plan
+   review and the `--confirm` push.** Swapping it for one ~0.022
+   ahead on an unconfirmed aggregation is not justified by what we
+   currently know.
+
+### Negative result worth recording
+
+`dare_adamerging` is the most complex method in the grid (DARE
+masking + AdaMerging's learned per-domain coefficients, requires a
+forward_fn, extra GPU pressure). It is **not clearly better** than
+plain `uniform` or `ties` on this validation set. Within noise it
+ties them. The bake-off does not endorse the complexity.
+
+### Bug to fix (separate change, not in this entry's scope)
+
+`scripts/run_bakeoff.select_winner` should rank by the CI-shaped
+metric, not avg pass@8, so future bake-off "Winner" lines actually
+match what gets graded. The avg-pass@8 ranking is what caused this
+selection to be misleading. Leaving as a known issue, not patched
+here.
+
+### Open items (do not treat as settled)
+
+- **CI aggregation formula** unconfirmed. The exact weighting / sum
+  vs average / per-benchmark metric definition needs to be read off
+  the course grader, not guessed.
+- **Validation set size (n=10/benchmark)** is too small to choose
+  between the top configs on signal. Either re-eval the top 2-3 on a
+  larger set, or document the statistical tie and keep the current
+  publication.
+- **Republish decision** is open. Defensible options: (a) keep ties
+  @ T=0.5 and add a note in the model card about the statistical
+  tie; (b) re-evaluate top candidates on a larger n and pick the
+  winner there; (c) republish dare_adamerging @ T=0.5 — only
+  warranted if we first confirm the CI aggregation AND find the
+  larger-n lead survives noise. Default in the absence of those two:
+  keep the current upload.
+- **Numbers above are transcribed**, not recomputed. The cluster has
+  the source scorecards; before acting on the re-ranking,
+  recomputation from `scorecard.json` is required.
+
+### What's not blocked by this
+
+Milestone 2 (2026-05-24) is past; the group model is published and
+will get graded on whatever the CI does. The findings above shape
+what we report and whether/how we iterate before the final
+deadline (2026-06-07), but do not block any other in-flight work.
+
+---
+
+## Day 8 follow-up #6 (2026-05-26) — AdaMerging metrics persistence + diagnostic re-run
+
+### Symptom
+
+`AdaMergingResult` already carries everything the report needs —
+`loss_history`, learned per-(task, layer) `coefficients`,
+`steps_run`, `early_stopped`. But the registry shim
+(`_adamerging_dict` in `merge/methods/__init__.py`) unwrapped it to
+just `.merged` so the pipeline could treat all methods uniformly.
+The bake-off (2026-05-26) therefore discarded those fields; the loss
+curve only existed in the bake-off's stdout log, which lived under
+`/tmp` and disappeared with the next pod restart.
+
+The follow-up #5 weight comparison showed `dare_adamerging`'s output
+sits within 0.74% of `dare_uniform`'s — too close to know whether
+AdaMerging learned little, or learned a lot that happened to net out
+small. The coefficients matrix is the only way to tell, and we
+threw it away.
+
+### Approach chosen: Option B (variant)
+
+Two paths considered:
+
+- **Option A** — make registry entries return `AdaMergingResult`
+  directly, branch in the pipeline. Cleaner type-wise, but breaks
+  the existing `test_dare_adamerging_composition` contract (asserts
+  the registry returns `dict`) and asks `merge_adapters` to do
+  isinstance dispatch on merge results.
+- **Option B (chosen)** — keep the registry-returns-dict contract,
+  add optional `metrics_out_path` + `task_names` kwargs to
+  `dare_adamerging` and `_adamerging_dict`. When both are supplied,
+  the wrappers persist the AdaMergingResult fields themselves before
+  unwrapping to a dict. The pipeline injects these kwargs when
+  `method in {"adamerging", "dare_adamerging"}`.
+
+Option B chosen because it preserves the uniform return-type
+contract (cheap pipeline, no isinstance branching) and is fully
+back-compat: direct callers that omit `metrics_out_path` see no
+behavioral change, so the synthetic-fixture composition test and
+the cluster smoke script keep working untouched.
+
+### Where the metrics file lives
+
+`merge_adapters` injects::
+
+    method_kwargs["metrics_out_path"] = output_dir / "adamerging_metrics.json"
+    method_kwargs["task_names"]       = list(adapters_by_domain.keys())
+
+So `adamerging_metrics.json` lands next to `config.json` /
+`model.safetensors` / `chat_template.jinja` inside the merged-model
+dir. That's the same dir that gets uploaded by `scripts/publish.py`
+— intentional: anyone re-pulling the published model can inspect
+its training story without separate artifact tracking.
+
+### task_names row-order correctness
+
+`coefficients` has shape `[N_tasks, N_layers]`; row `i` MUST
+correspond to `task_names[i]` or the report figure is wrong. The
+chain is:
+
+1. `merge_adapters` calls `load_all(adapters_dir, ...)` returning
+   `adapters_by_domain: dict[str, dict[str, Tensor]]` in
+   `CANONICAL_DOMAINS` insertion order (math, general_knowledge,
+   safety, multilingual).
+2. `task_vectors = list(adapters_by_domain.values())` — index `i`
+   is `list(adapters_by_domain.keys())[i]`.
+3. `task_names = list(adapters_by_domain.keys())` is what gets
+   injected into method_kwargs.
+4. `dare_adamerging` passes `task_vectors` (dared) into
+   `adamerging` in that same order.
+5. `adamerging` builds `coefficients[i, :]` from `task_vectors[i]`.
+
+So `coefficients[i]` ⇄ `task_names[i]` ⇄ `task_vectors[i]` ⇄
+adapter at `adapters_dir/task_names[i]/`. The persistence helper
+`_persist_adamerging_metrics` also defensively raises if
+`len(task_names) != coefficients.shape[0]` so a future refactor
+that desyncs the two surfaces the bug instead of silently
+mislabeling rows.
+
+### Schema of `adamerging_metrics.json`
+
+```
+{
+  "task_names":    [str, ...]    # length N_tasks, row order for coefficients
+  "n_tasks":       int,          # N_tasks
+  "n_layers":      int,          # N_layers
+  "steps_run":     int,
+  "early_stopped": bool,
+  "loss_history":  [float, ...]  # length steps_run, total loss per step
+  "coefficients":  [[float, ...], ...]    # shape [N_tasks, N_layers]
+  "hyperparams": {
+      "method":              "dare_adamerging" | "adamerging",
+      "drop_rate":           float,        # dare_adamerging only
+      "seed":                int | null,   # dare_adamerging only
+      "rescale":             bool,         # dare_adamerging only
+      "init_coefficient":    float,
+      "lr":                  float,
+      "lambda_l2":           float,
+      "max_steps":           int,
+      "early_stop_patience": int,
+      ...                                    # forward_fn / data_iter excluded
+  }
+}
+```
+
+Plain JSON, no torch dependency for read-back — matplotlib in the
+diagnostic and any future analysis script can load it directly.
+
+### Standalone diagnostic re-run
+
+`scripts/adamerging_diagnostic.py` re-runs `dare_adamerging` on the
+4 real adapters with the bake-off hyperparameters (drop_rate=0.5,
+seed=42, max_steps=200, lr=1e-2, lambda_l2=1e-4,
+init_coefficient=0.3, batch_size=2), captures the full
+`AdaMergingResult`, and writes:
+
+- `metrics.json`               — same schema as above
+- `loss_curve.png`             — loss vs step
+- `coefficients_heatmap.png`   — `[N_tasks × N_layers]` RdBu_r
+  heatmap with `task_names` as y-labels
+
+Default output dir is
+`/scratch/Group/emainelpe_group_model/adamerging_diagnostic/` and
+the script explicitly refuses any output path under `/tmp` (that's
+the exact failure mode that lost the bake-off's curve).
+
+The script does NOT push to HF and does NOT run `merge_and_unload`
+— it short-circuits at the AdaMerging step, so it's cheap to
+re-run with different hyperparameters if the figures need updating
+for the report.
+
+### Tests
+
+5 new tests in `merge/tests/test_adamerging.py`:
+
+- `test_dare_adamerging_persists_metrics_when_path_provided`:
+  full schema check + row-order check (the safety row has a
+  distinctive value).
+- `test_dare_adamerging_no_metrics_when_path_omitted`: back-compat
+  — `tmp_path` stays empty when `metrics_out_path=None`.
+- `test_dare_adamerging_metrics_requires_task_names`: refuse the
+  ambiguous-row case.
+- `test_adamerging_registry_shim_persists_metrics`: bare
+  `adamerging` registry entry also works; `forward_fn`/`data_iter`
+  do NOT leak into the hyperparams snapshot (they're
+  non-serializable).
+- `test_persist_adamerging_metrics_rejects_task_name_length_mismatch`:
+  defensive shape check.
+
+All five use `monkeypatch` to replace `adamerging` with a fake
+returning a small synthetic `AdaMergingResult`, so the tests stay
+CPU-light (torch-only, no transformers / no GPU).
+
+### What still has to happen on the cluster
+
+`scripts/adamerging_diagnostic.py` is the gate. It produces the
+figures for the final report; the laptop can only verify the
+plumbing. Launch::
+
+    nohup python3 scripts/adamerging_diagnostic.py \
+        --adapters-dir loras/ \
+        --output-dir /scratch/Group/emainelpe_group_model/adamerging_diagnostic/ \
+        > adamerging_diagnostic.log 2>&1 &
+
+Should take ~5-10 min on an A100-40g (200 training steps, no
+merge_and_unload).
+
+### What this does NOT change
+
+- The published group model (`cs-552-2026-emainelpe/group_model` =
+  ties @ T=0.5) is untouched. Metrics persistence is read-only data
+  collection; it does not influence the merge result.
+- Future bake-off runs through `scripts/run_bakeoff.py` automatically
+  benefit — when the bakeoff invokes `merge_adapters` for
+  `dare_adamerging`, the metrics file lands in the per-(method, temp)
+  merged dir alongside the model. No bakeoff change needed.

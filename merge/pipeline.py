@@ -184,7 +184,16 @@ def merge_adapters(
                 f"valid options are {sorted(METHOD_REGISTRY.keys())!r}"
             )
 
-        kwargs = method_kwargs or {}
+        kwargs = dict(method_kwargs or {})
+        # AdaMerging produces metrics (loss curve, learned per-(task, layer)
+        # coefficients) that the dict-return contract of merge_fn would
+        # otherwise discard. Inject a metrics-out path + the task_names so
+        # the registry wrappers can persist them alongside the merged model.
+        # task_names row order matches task_vectors index order, which is
+        # ``list(adapters_by_domain.values())`` ⇄ ``list(adapters_by_domain.keys())``.
+        if method in {"adamerging", "dare_adamerging"}:
+            kwargs.setdefault("metrics_out_path", output_dir / "adamerging_metrics.json")
+            kwargs.setdefault("task_names", list(adapters_by_domain.keys()))
         merge_fn = METHOD_REGISTRY[method]
         merged = merge_fn(task_vectors, **kwargs)
 
