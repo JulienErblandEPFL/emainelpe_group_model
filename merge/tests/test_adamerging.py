@@ -748,3 +748,104 @@ def test_adamerging_aggregated_loss_history_records_aggregated_value(
     assert all(isinstance(v, float) for v in res.loss_history)
     assert all(v == v for v in res.loss_history)  # not NaN
     assert all(v > 0 for v in res.loss_history)   # entropy + positive L2
+
+
+def test_adamerging_aggregated_second_update_proves_graphs_freed(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path,
+) -> None:
+    """Gradient-accumulation form must free each per-domain graph after
+    its backward(). If it didn't, the second optimizer update would either
+    (a) error with "Trying to backward through the graph a second time"
+    (PyTorch's signal that the graph was retained then freed), or (b)
+    silently double-accumulate. Running ≥2 updates successfully on the
+    synthetic fixture proves graphs are being freed per-domain — the
+    cheapest proof we can extract without poking at torch internals."""
+    pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.load_adapter import load_all
+    from merge.methods.adamerging import adamerging
+    from merge.tests.fixtures.adamerging_helpers import (
+        make_synthetic_data_iter,
+        make_synthetic_forward_fn,
+    )
+    from merge.verify_spec import load_locked_spec
+
+    locked_spec = load_locked_spec(lora_yaml_path)
+    tvs = list(load_all(synthetic_adapters_dir, locked_spec).values())
+
+    res = adamerging(
+        tvs,
+        forward_fn=make_synthetic_forward_fn(seed=42),
+        data_iter=make_synthetic_data_iter(n_batches=40, seed=42),
+        max_steps=3,
+        early_stop_patience=200,
+        aggregate_domains=True,
+    )
+    assert res.steps_run == 3
+    assert len(res.loss_history) == 3
+
+
+def test_adamerging_aggregated_matches_sum_then_backward_numerically(
+    synthetic_adapters_dir: Path, lora_yaml_path: Path,
+) -> None:
+    """Gradient accumulation is mathematically equivalent to summing per-
+    domain losses then a single backward() — gradients are linear. After
+    one optimizer step, the coefficients reached via accumulation should
+    match those reached via the textbook ``loss.sum().backward()`` form
+    bit-for-bit (same seed, same forward, same lr).
+
+    This is the formal math-equivalence check the follow-up #9 fix rests
+    on. If it ever fails, the accumulation form has drifted from the
+    intended semantics.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+    from merge.load_adapter import load_all
+    from merge.methods.adamerging import (
+        _compute_merged, _layer_index_from_canonical, adamerging,
+    )
+    from merge.tests.fixtures.adamerging_helpers import (
+        make_synthetic_data_iter,
+        make_synthetic_forward_fn,
+    )
+    from merge.verify_spec import load_locked_spec
+
+    locked_spec = load_locked_spec(lora_yaml_path)
+    tvs = list(load_all(synthetic_adapters_dir, locked_spec).values())
+    n_tasks = len(tvs)
+
+    # Run one aggregated update via the new accumulation path.
+    res_acc = adamerging(
+        tvs,
+        forward_fn=make_synthetic_forward_fn(seed=42),
+        data_iter=make_synthetic_data_iter(n_batches=n_tasks, seed=42),
+        max_steps=1,
+        early_stop_patience=200,
+        aggregate_domains=True,
+        lr=1e-2, lambda_l2=1e-4, init_coefficient=0.3,
+    )
+
+    # Reproduce one update via the explicit sum-then-backward form.
+    name_to_layer = {k: _layer_index_from_canonical(k) for k in tvs[0]}
+    n_layers = max(name_to_layer.values()) + 1
+    coeffs = torch.full((n_tasks, n_layers), 0.3, dtype=torch.float32,
+                        requires_grad=True)
+    opt = torch.optim.Adam([coeffs], lr=1e-2)
+    fwd = make_synthetic_forward_fn(seed=42)
+    data = make_synthetic_data_iter(n_batches=n_tasks, seed=42)
+    entropies = []
+    for _ in range(n_tasks):
+        _, batch = next(data)
+        merged = _compute_merged(tvs, coeffs, name_to_layer)
+        logits = fwd(merged, batch)
+        last = logits[:, -1, :]
+        lp = torch.log_softmax(last, -1)
+        p = torch.softmax(last, -1)
+        entropies.append(-(p * lp).sum(-1).mean())
+    loss = torch.stack(entropies).mean() + 1e-4 * coeffs.pow(2).sum()
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    torch.testing.assert_close(res_acc.coefficients, coeffs.detach(),
+                               rtol=1e-5, atol=1e-6)

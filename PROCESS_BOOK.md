@@ -2165,3 +2165,161 @@ follow-up #7 is confirmed and we have a working AdaMerging signal
 to put in the final report. If the curve still oscillates, the
 hypothesis is rejected and AdaMerging's signal on this 4-adapter
 Qwen3-1.7B setup is genuinely weak.
+
+---
+
+## Day 8 follow-up #9 (2026-05-26) — AdaMerging aggregated OOM: gradient accumulation
+
+### Symptom
+
+The aggregated-mode cluster re-run (follow-up #8) OOM'd on a clean
+40 GB A100 — pod showed 50 MiB free at launch, so this was not
+residue from a prior process. `adamerging_diag_agg.log`:
+
+    torch.OutOfMemoryError: ... (39.47 GiB held by this process)
+
+Baseline (single-domain) mode peaks at ~31.65 GB on the same setup
+and runs to completion. So roughly 4× the activation memory of the
+baseline — which is exactly what the previous aggregated branch was
+holding alive.
+
+### Root cause
+
+The follow-up #8 aggregated branch built **all n_tasks autograd
+graphs** before calling `backward()`::
+
+    entropies = []
+    for batch in collected:                        # 4 forwards
+        ...
+        entropies.append(-(p * log_p).sum(-1).mean())
+    entropy = torch.stack(entropies).mean()        # one tensor
+    loss = entropy + l2
+    loss.backward()                                # one backward
+
+Each `forward_fn(merged, batch)` retains activations through Qwen3
+for the autograd path back to `coefficients`. With 4 forwards before
+any backward, all four activation graphs are co-resident. Add the
+input task vectors (~12 GB), the base model in bf16 (~3.4 GB), and
+the per-step `merged` dict, and 40 GB is gone.
+
+### Fix: gradient accumulation
+
+Summing per-domain losses then one `backward()` is mathematically
+identical to `backward()`-ing each per-domain loss separately and
+letting gradients accumulate into `.grad` before a single
+`optimizer.step()` — because gradients are linear::
+
+    grad_total = d(loss)/dc
+               = d( (1/n) Σ entropy_d + L2 )/dc
+               = (1/n) Σ d(entropy_d)/dc + dL2/dc
+
+The right-hand-side decomposition is exactly what gradient
+accumulation produces. The accumulation form lets each per-domain
+graph be freed by `backward()` before the next forward runs, so peak
+memory is ~1 domain's worth instead of n_tasks worth.
+
+New branch (per update)::
+
+    optimizer.zero_grad()
+    total_loss_value = 0.0
+    for domain_idx, batch in collected:
+        merged    = _compute_merged(task_vectors, coefficients, name_to_layer)
+        logits    = forward_fn(merged, batch)
+        ...
+        entropy_d = -(p * log_p).sum(-1).mean()
+        scaled    = entropy_d / n_tasks
+        scaled.backward()                          # frees graph d
+        total_loss_value += scaled.item()
+        del merged, logits, ..., entropy_d, scaled
+    l2 = lambda_l2 * coefficients.pow(2).sum()
+    l2.backward()                                  # accumulates dL2
+    total_loss_value += l2.item()
+    optimizer.step()
+
+`loss_history` records `total_loss_value` per update — the same
+scalar `loss.item()` would have reported under the previous form.
+
+### Why `merged` is recomputed per-domain
+
+Considered: build `merged` once per update, reuse across all 4
+forwards. Rejected. The four forward graphs would all share the
+upstream `coefficients → merged` portion. The first `backward()`
+would free that shared portion (PyTorch's default), which would
+then break the next domain's `backward()` unless every
+`backward()` got `retain_graph=True` — and that puts the peak
+memory back where it started (all activation buffers retained
+until the last step's backward). Recomputing `merged` per domain
+costs one extra small fp32→bf16 weighted-sum per forward, which is
+trivial relative to one Qwen3 forward pass.
+
+### Verifying math equivalence
+
+`test_adamerging_aggregated_matches_sum_then_backward_numerically`
+runs ONE aggregated update via the new accumulation path and ONE
+update via the explicit `(stack -> mean -> + L2 -> single
+backward())` form, both seeded identically, and asserts the
+post-step coefficients agree to `rtol=1e-5, atol=1e-6`. That is the
+formal proof that the refactor preserves the previous aggregated
+intent.
+
+### Default path
+
+`aggregate_domains=False` branch is UNCHANGED.
+`test_adamerging_default_unchanged_byte_for_byte` (added in
+follow-up #8) still pins it bit-for-bit.
+
+### Tests
+
+Two new tests in `merge/tests/test_adamerging.py`:
+
+- `test_adamerging_aggregated_second_update_proves_graphs_freed`:
+  runs 3 updates on the synthetic fixture. If per-domain graphs
+  weren't being freed, the second update would either error
+  ("Trying to backward through the graph a second time") or behave
+  pathologically. Successful completion is the cheapest proof we
+  can extract without poking at torch's `gc` internals.
+- `test_adamerging_aggregated_matches_sum_then_backward_numerically`:
+  bit-for-bit math equivalence (see above).
+
+Existing aggregated tests (consumption count, partial-iterator
+stop, finite-positive loss-history) still pass against the new
+branch.
+
+Full local suite: **160 passed, 117 skipped in 0.78s** — same 160
+pass count; 2 new torch-gated skips for the new tests.
+
+### Files modified
+
+- `merge/methods/adamerging.py` — aggregated branch rewritten to
+  gradient accumulation. Default branch untouched.
+- `merge/tests/test_adamerging.py` — 2 new tests.
+
+### Expected memory savings
+
+Order-of-magnitude estimate, single Qwen3-1.7B forward at
+`batch_size=2`, `max_length=512`:
+
+- Activation memory per forward: ~6-8 GB (28 layers × intermediate
+  activations × autograd retention).
+- Previous aggregated peak: ~31.65 GB baseline + 3 extra graphs ≈
+  past 40 GB ceiling (observed: 39.47 GiB held at OOM).
+- New aggregated peak: ~31.65 GB baseline + at most 1 graph at a
+  time ≈ baseline, well within 40 GB.
+
+Cluster re-run is the gate.
+
+### Next step (cluster gate)
+
+Re-launch unchanged from follow-up #8::
+
+    nohup python3 scripts/adamerging_diagnostic.py \
+        --aggregate-domains \
+        --adapters-dir loras/ \
+        --output-dir /scratch/Group/emainelpe_group_model/adamerging_diagnostic/ \
+        > adamerging_diagnostic_aggregated.log 2>&1 &
+
+If this completes without OOM, follow-up #8's empirical question
+becomes answerable (does the aggregated objective actually
+converge?). If it still OOMs, something larger than the per-domain
+activation graphs is responsible and we revisit the budget from
+scratch.

@@ -268,25 +268,47 @@ def adamerging(
                     n_tasks, n_tasks, len(seen_domains), sorted(seen_domains),
                 )
 
-            merged = _compute_merged(task_vectors, coefficients, name_to_layer)
-            per_domain_entropies = []
+            # Gradient accumulation, not sum-then-backward. Building all
+            # n_tasks autograd graphs and summing entropies into one loss
+            # holds n_tasks graphs (activations) alive until the single
+            # backward() — that's the ~4× peak that OOM'd a clean 40 GB
+            # A100 (39.47 GiB held; see follow-up #9 in PROCESS_BOOK).
+            # Backward()-ing each per-domain (entropy_d / n_tasks) frees
+            # its graph immediately and accumulates into ``coefficients.grad``;
+            # adding L2 as one final backward keeps the optimizer.step()
+            # mathematically identical (gradients are linear).
+            #
+            # ``merged`` is recomputed per-domain on purpose. If we built
+            # it once and reused it across the n_tasks forwards, the four
+            # forward graphs would share the upstream ``coefficients ->
+            # merged`` portion. The first backward would free that shared
+            # portion, breaking subsequent backwards unless we passed
+            # ``retain_graph=True`` everywhere — which puts the peak
+            # memory right back where it was. Recomputing merged per
+            # domain is the memory-correct choice; the cost is small
+            # relative to one Qwen3 forward.
+            optimizer.zero_grad()
+            total_loss_value = 0.0
+            n_eff = float(n_tasks)
             for domain_idx, batch in collected:
+                merged = _compute_merged(task_vectors, coefficients, name_to_layer)
                 logits = forward_fn(merged, batch)
                 last_logits = logits[:, -1, :]
                 log_probs = torch.log_softmax(last_logits, dim=-1)
                 probs = torch.softmax(last_logits, dim=-1)
-                per_domain_entropies.append(
-                    -(probs * log_probs).sum(dim=-1).mean()
-                )
-            entropy = torch.stack(per_domain_entropies).mean()
+                entropy_d = -(probs * log_probs).sum(dim=-1).mean()
+                scaled = entropy_d / n_eff
+                scaled.backward()
+                total_loss_value += scaled.item()
+                # Drop the per-domain graph references explicitly so they
+                # can be reclaimed before the next forward.
+                del merged, logits, last_logits, log_probs, probs, entropy_d, scaled
             l2 = lambda_l2 * coefficients.pow(2).sum()
-            loss = entropy + l2
-
-            optimizer.zero_grad()
-            loss.backward()
+            l2.backward()
+            total_loss_value += l2.item()
             optimizer.step()
 
-            loss_value = loss.item()
+            loss_value = total_loss_value
             loss_history.append(loss_value)
             steps_run = step + 1
 
@@ -297,10 +319,11 @@ def adamerging(
                 steps_since_improvement += 1
 
             if step % progress_log_every == 0 or step == max_steps - 1:
+                l2_value = l2.item()
                 logger.info(
-                    "adamerging (aggregated) update=%d loss=%.4f entropy=%.4f "
+                    "adamerging (aggregated) update=%d loss=%.4f entropy_mean=%.4f "
                     "l2=%.6f best=%.4f domains=%s",
-                    step, loss_value, entropy.item(), l2.item(), best_loss,
+                    step, loss_value, loss_value - l2_value, l2_value, best_loss,
                     sorted(seen_domains),
                 )
 
