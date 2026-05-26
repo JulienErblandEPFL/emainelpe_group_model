@@ -145,6 +145,54 @@ def test_dare_preserves_dtype() -> None:
         assert tensor.dtype == torch.bfloat16
 
 
+def test_dare_does_not_upcast_to_fp32_internally() -> None:
+    """Regression for the 2026-05-26 bake-off DARE OOM.
+
+    A bf16 input must yield a bf16 output with NO intermediate fp32
+    materialization. We check this two ways:
+
+    1. Output dtype matches input dtype exactly (no implicit upcast).
+    2. The output occupies the bf16 byte count for its element count
+       (2 bytes/elem), not the fp32 byte count (4 bytes/elem).
+
+    The previous implementation built an fp32 keep_prob tensor + an
+    fp32 mask + cast `tensor` to fp32, materializing ~9× the input
+    size in fp32 memory before casting back. For the 4-adapter
+    Qwen3-1.7B ΔW set that peak alone exceeded 40 GB on an A100-40g.
+    """
+    torch = pytest.importorskip("torch")
+    from merge.methods.dare import dare
+
+    tv = _make_random_tv(seed=0)
+    out = dare(tv, drop_rate=0.5, seed=0)
+    for name, tensor in out.items():
+        assert tensor.dtype == torch.bfloat16, (
+            f"{name}: dtype upcast leaked into output ({tensor.dtype})"
+        )
+        # bf16 = 2 bytes/elem; fp32 = 4 bytes/elem. The output must hold
+        # bf16 storage, not fp32-converted-back storage.
+        assert tensor.element_size() == 2, (
+            f"{name}: element_size {tensor.element_size()} != 2 (bf16)"
+        )
+
+
+def test_dare_fp32_input_stays_fp32(_seed: int = 0) -> None:
+    """Input dtype is preserved end-to-end, including fp32.
+
+    Belt-and-suspenders: previously the function always returned bf16
+    after the explicit ``.to(tensor.dtype)`` cast, so fp32-in / fp32-out
+    happened to work. The cleaned-up code drops the explicit cast and
+    relies on torch's promotion rules — verify fp32-in still yields
+    fp32-out.
+    """
+    torch = pytest.importorskip("torch")
+    from merge.methods.dare import dare
+
+    tv = {"a": torch.randn(16, 16, dtype=torch.float32)}
+    out = dare(tv, drop_rate=0.3, seed=0)
+    assert out["a"].dtype == torch.float32
+
+
 def test_dare_does_not_modify_input() -> None:
     torch = pytest.importorskip("torch")
     from merge.methods.dare import dare

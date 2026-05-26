@@ -1372,3 +1372,105 @@ Implementation:
 2. If both look right: re-run with `--confirm`.
 3. CI run on `cs-552-2026-emainelpe/group_model` post-push to confirm
    the leaderboard hits the same pass@8 numbers we saw locally.
+
+---
+
+## Day 8 follow-up #3 (2026-05-26) — DARE fp32 upcast OOM
+
+### Symptom
+
+In the bake-off (`bakeoff_20260526_1145`), both DARE-based methods
+failed during merge:
+
+- `dare_uniform`: `merge:failed` in 1.7s — same 4 adapters as the
+  successful `uniform` and `ties` runs, no forward_fn loaded.
+- `dare_adamerging`: `merge:failed` in 1.1s.
+
+Both OOM'd at `merge/methods/dare.py:84`:
+
+    masked = tensor.to(torch.float32) * mask * rescale_factor
+    torch.OutOfMemoryError: CUDA out of memory ... GPU has 39.49 GiB
+    total, ~15 MiB free
+
+The decisive clue: `dare_uniform` crashed with NO forward_fn resident
+— the 39.47 GiB was all coming from the merge itself. `uniform` and
+`ties` (same 4 task vectors, no DARE) ran fine. So the dare()
+implementation was the sole cause.
+
+### Root cause
+
+The function built THREE full-size fp32 allocations per input tensor:
+
+1. `keep_prob_t = torch.full(tensor.shape, ..., dtype=torch.float32)`
+2. `mask = torch.bernoulli(keep_prob_t, ...)` — also fp32 (Bernoulli
+   returns input dtype).
+3. `tensor.to(torch.float32)` — a full fp32 copy of the input.
+4. Their pairwise product — another fp32 intermediate.
+
+Per-iteration peak ≈ 9× the bf16 input size (2 bytes/elem in,
+~18 bytes/elem at peak). Across 4 adapters × 196 target modules,
+CUDA caching allocator fragmentation pushed reserved memory past
+40 GB before the loop could free anything.
+
+bf16 was chosen for the merge throughout the rest of the pipeline
+precisely because fp32 doesn't fit. The fp32 upcast in dare() was a
+leftover from the Stage 3 implementation when memory budget hadn't
+been pressure-tested.
+
+### Fix
+
+Mask + multiply in the input dtype:
+
+    keep_prob_t = torch.full(
+        tensor.shape, keep_prob, dtype=tensor.dtype, device=tensor.device,
+    )
+    mask = torch.bernoulli(keep_prob_t, generator=generator)
+    out[name] = tensor * mask * rescale_factor
+
+bf16 precision is overkill for the operation — the mask is 0 or 1
+(both exactly representable), the rescale is one scalar multiply,
+and DARE's own stochastic variance dwarfs any bf16 rounding. For
+the canonical `drop_rate=0.5`, `keep_prob=0.5` is exact in bf16;
+other drop rates have bf16 rounding error ~10⁻³ on the Bernoulli
+probability — well below the method's intrinsic randomness.
+
+### Tests
+
+`test_dare.py`'s existing tests (statistical drop-ratio, mean
+preservation under rescale, key/shape/dtype preservation,
+reproducibility, no-input-mutation) all asserted properties that the
+bf16 implementation preserves — no test changes needed beyond
+adding two regression tests:
+
+- `test_dare_does_not_upcast_to_fp32_internally` — asserts the
+  output dtype matches input dtype AND ``element_size() == 2`` (bf16
+  storage, not fp32-converted-back storage). Catches a future
+  regression that adds an implicit upcast.
+- `test_dare_fp32_input_stays_fp32` — belt-and-suspenders: the
+  cleaned-up code drops the explicit ``.to(tensor.dtype)`` cast and
+  relies on torch promotion; verify fp32-in still yields fp32-out
+  for non-bf16 callers.
+
+### Memory budget for dare_adamerging post-fix
+
+- forward_fn base: ~3.46 GB (bf16 Qwen3-1.7B)
+- 4 DARE'd task vectors: ~13.6 GB (4 × 3.4 GB bf16)
+- merged dict recomputed per AdaMerging step: ~3.4 GB bf16
+- AdaMerging activations (batch_size=2, modest seq len, only the
+  delta path retains activations because base params are
+  `requires_grad=False`): ~5-10 GB rough upper bound
+- Coefficients + Adam state: negligible (4 × 28 = 112 floats)
+
+Estimated peak: ~25-30 GB. Comfortable headroom on a 40 GB A100.
+The cluster re-run is the verification gate — if a spike pushes it
+over, the next steps are activation checkpointing or a smaller
+AdaMerging batch.
+
+### What this unblocks
+
+The first bake-off only fully scored 2 of 4 methods (uniform, ties).
+With dare() fixed, the cluster can re-run `dare_uniform` and
+`dare_adamerging` against the same input adapters (deterministic
+seeds) and complete the 4-method comparison for the final report.
+The ties @ T=0.5 winner identified in the partial bake-off does NOT
+need re-validation — DARE only affected the failed runs.

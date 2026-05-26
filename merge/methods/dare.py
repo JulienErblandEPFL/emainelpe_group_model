@@ -76,12 +76,24 @@ def dare(
                 f"DARE requires floating-point tensors; {name!r} has dtype {tensor.dtype}"
             )
 
-        # Bernoulli in fp32 for numerical headroom; rescale + cast back at the end.
+        # Mask + rescale stay in the input dtype (bf16 in practice). The
+        # previous version upcast `tensor` to fp32 and built an fp32 mask,
+        # which materialized full-size fp32 copies of every ΔW tensor —
+        # for the 4-adapter set across Qwen3-1.7B's 196 target modules
+        # that peak exceeded 40 GB on an A100-40g and OOM'd both
+        # DARE-based methods in the 2026-05-26 bake-off (with no
+        # forward_fn loaded, so the upcast was the sole cause).
+        #
+        # bf16 is more than adequate here: the mask is sampled from a
+        # Bernoulli with probability ``keep_prob`` (exactly representable
+        # in bf16 for the canonical 0.5 drop rate; ~3-decimal error
+        # otherwise, far below DARE's own stochastic variance), the
+        # rescale is a single scalar multiply, and the result is 0 or
+        # (rescaled-original) — no precision loss matters.
         keep_prob_t = torch.full(
-            tensor.shape, keep_prob, dtype=torch.float32, device=tensor.device
+            tensor.shape, keep_prob, dtype=tensor.dtype, device=tensor.device
         )
         mask = torch.bernoulli(keep_prob_t, generator=generator)
-        masked = tensor.to(torch.float32) * mask * rescale_factor
-        out[name] = masked.to(tensor.dtype)
+        out[name] = tensor * mask * rescale_factor
 
     return out
