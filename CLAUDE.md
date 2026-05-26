@@ -107,7 +107,12 @@ entirely.
   same input adapters in one orchestrated run; ~3.5-4 hours on cluster;
   outputs aggregated `bakeoff_results.json` + per-(method, temperature)
   eval subdirs; per-(method, temperature) failures isolated). Launch:
-  `nohup python -u scripts/run_bakeoff.py --adapters-dir loras/ --output-dir bakeoff_<date>/ > bakeoff.log 2>&1 &`.
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python -u scripts/run_bakeoff.py --adapters-dir loras/ --output-dir bakeoff_<date>/ > bakeoff.log 2>&1 &`.
+  The `PYTORCH_CUDA_ALLOC_CONF` env var reduces fragmentation across the
+  multiple base-model alloc/free cycles in one bake-off — pair with the
+  Day 8 follow-up that scopes the AdaMerging forward_fn to the
+  `dare_adamerging` merge only (was: held for the entire bake-off, which
+  starved vLLM on every eval).
 
 ## Files to NEVER touch from a coding task
 

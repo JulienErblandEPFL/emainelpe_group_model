@@ -96,6 +96,7 @@ def merge_adapters(
     generation_config: dict[str, Any] | None = None,
     base_model_repo: str = "Qwen/Qwen3-1.7B",
     device: str | None = None,
+    base_model: Any = None,
 ) -> Path:
     """Run the full merge pipeline and write a full HF-format model directory.
 
@@ -119,6 +120,14 @@ def merge_adapters(
         device: Compute device for loading + merging. ``None`` (default)
             auto-selects ``"cuda"`` when ``torch.cuda.is_available()``,
             otherwise ``"cpu"``.
+        base_model: Optional pre-loaded base model (``nn.Module``). When
+            provided, the pipeline skips ``from_pretrained`` (saving ~3.4 GB
+            of duplicate GPU allocation) and reuses this instance for the
+            PEFT wrap + ``merge_and_unload``. ``merge_and_unload`` mutates
+            the model in place — callers MUST consider the passed model
+            consumed (do not reuse it after this call). The pipeline does
+            NOT free the externally-owned model in its finally block; the
+            caller retains ownership.
 
     Returns:
         The ``output_dir`` path (now populated with ``config.json``,
@@ -157,6 +166,7 @@ def merge_adapters(
     base = None
     peft_model = None
     merged_model = None
+    base_externally_owned = base_model is not None
     adapters_by_domain: dict[str, Any] | None = None
     task_vectors: list[Any] | None = None
     factorized: dict[str, tuple[Any, Any]] | None = None
@@ -194,12 +204,18 @@ def merge_adapters(
             factorized[canonical] = (lora_a, lora_b)
         logger.info("SVD-factored %d merged ΔW tensors to rank-%d", len(factorized), r)
 
-        logger.info("Loading base model %s onto %s", base_model_repo, device)
-        base = AutoModelForCausalLM.from_pretrained(
-            base_model_repo,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-        )
+        if base_model is not None:
+            logger.info(
+                "Reusing externally-provided base model (skipping from_pretrained)"
+            )
+            base = base_model
+        else:
+            logger.info("Loading base model %s onto %s", base_model_repo, device)
+            base = AutoModelForCausalLM.from_pretrained(
+                base_model_repo,
+                torch_dtype=torch.bfloat16,
+                device_map=device,
+            )
 
         lora_config = LoraConfig(
             r=int(locked_spec["r"]),
@@ -285,9 +301,18 @@ def merge_adapters(
     finally:
         # Drop every name that could be holding GPU tensors. The locals are
         # all initialized to None before the try so unconditional del is safe.
+        # When the base model was passed in by the caller, we must NOT release
+        # it here — the caller still owns it (e.g. the AdaMerging forward_fn
+        # in run_bakeoff.py owns the model for its own cleanup path). Note
+        # that ``peft_model``/``merged_model`` wrap and (for merge_and_unload)
+        # consume the same underlying base; the caller is contractually
+        # responsible for treating the model as consumed regardless.
         del peft_model
         del merged_model
-        del base
+        if not base_externally_owned:
+            del base
+        else:
+            base = None  # drop our local handle without freeing the model
         del state_update
         del existing_state
         del factorized

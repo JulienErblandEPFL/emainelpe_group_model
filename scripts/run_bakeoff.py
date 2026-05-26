@@ -51,7 +51,12 @@ Default output_dir is ``<repo_root>/bakeoff_<YYYY-MM-DD-HHMM>/``.
 
 Usage::
 
-    # Background run with unbuffered logs
+    # Background run with unbuffered logs. The ``PYTORCH_CUDA_ALLOC_CONF``
+    # env var reduces CUDA pool fragmentation across the methods — useful
+    # because the bake-off allocates / frees a ~3.4 GB base model several
+    # times. Belt-and-suspenders with the structural fix that scopes the
+    # AdaMerging forward_fn to the dare_adamerging merge only.
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
     nohup python -u scripts/run_bakeoff.py \\
         --adapters-dir loras/ \\
         --output-dir bakeoff_2026-05-21-1400/ \\
@@ -474,7 +479,7 @@ def run_bakeoff(
     merge_callable: Callable[..., Path],
     eval_callable: Callable[..., dict[str, Any]],
     config_factory: Callable[[float, argparse.Namespace], Any],
-    adamerging_state: dict[str, Any] | None,
+    adamerging_state_factory: Callable[[], tuple[dict[str, Any], Callable[[], None]]] | None,
 ) -> tuple[BakeoffPayload, int]:
     """Execute the bake-off across all methods × temperatures.
 
@@ -487,13 +492,27 @@ def run_bakeoff(
         eval_callable: Function with the signature of
             :func:`merge.eval_all.evaluate_all_benchmarks`.
         config_factory: ``(temperature, args) -> InferenceConfig``.
-        adamerging_state: ``{"forward_fn": ..., "data_iter": ...}`` or
-            ``None`` if dare_adamerging is not in the sweep.
+        adamerging_state_factory: Zero-arg callable that builds the
+            AdaMerging state on demand, returning
+            ``(state_dict, cleanup_callable)``. ``state_dict`` must carry
+            ``"forward_fn"`` and ``"data_iter"`` (and optionally
+            ``"base_model"``, which is forwarded to ``merge_callable`` to
+            avoid loading a second copy). Called ONCE — immediately before
+            the ``dare_adamerging`` merge — and cleaned up IMMEDIATELY
+            after that merge returns (success or failure), so the GPU is
+            free for every subsequent eval and merge. ``None`` if
+            ``dare_adamerging`` is not in the sweep.
 
     Returns:
         ``(payload, exit_code)``. exit_code is 0 if every (method,
         temperature) succeeded, 1 if any failed.
     """
+    import gc
+
+    try:
+        import torch  # type: ignore
+    except ImportError:  # pragma: no cover — laptop / test env
+        torch = None  # type: ignore
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     payload = BakeoffPayload(
@@ -511,18 +530,55 @@ def run_bakeoff(
         sweep_dir = method_dir / "sweep"
         method_dir.mkdir(parents=True, exist_ok=True)
 
+        # AdaMerging forward_fn lifetime is scoped to THIS merge only.
+        # For every other method, no forward_fn is ever resident. This is
+        # what unblocks vLLM during evals — the original 2026-05-26 bake-off
+        # held a ~3.4 GB base model for the whole run, starving vLLM on
+        # every eval with "Engine core initialization failed".
+        adamerging_state: dict[str, Any] | None = None
+        adamerging_cleanup: Callable[[], None] | None = None
+        adamerging_build_error: str | None = None
+        if method == "dare_adamerging":
+            if adamerging_state_factory is None:
+                adamerging_build_error = (
+                    "dare_adamerging requires an adamerging_state_factory; "
+                    "got None"
+                )
+            else:
+                try:
+                    logger.info(
+                        "[%s] Building AdaMerging forward_fn + data_iter ...",
+                        method,
+                    )
+                    adamerging_state, adamerging_cleanup = adamerging_state_factory()
+                except Exception:
+                    adamerging_build_error = traceback.format_exc()
+                    logger.error(
+                        "[%s] AdaMerging state build FAILED:\n%s",
+                        method, adamerging_build_error,
+                    )
+
         try:
             method_kwargs = build_method_kwargs(
                 method, adamerging_state, args.adamerging_max_steps,
-            )
+            ) if adamerging_build_error is None else None
         except ValueError as exc:
-            logger.error("Skipping method %s: %s", method, exc)
+            adamerging_build_error = str(exc)
+            method_kwargs = None
+
+        if adamerging_build_error is not None:
+            logger.error("Skipping method %s: %s", method, adamerging_build_error)
+            if adamerging_cleanup is not None:
+                try:
+                    adamerging_cleanup()
+                except Exception:
+                    logger.exception("[%s] AdaMerging cleanup failed", method)
             row = MethodRunRow(
                 method=method,
                 merge_status="failed",
                 merge_duration_seconds=0.0,
                 merged_dir=str(merged_dir),
-                merge_error=str(exc),
+                merge_error=adamerging_build_error,
             )
             payload.runs.append(row)
             _write_bakeoff_results(args.output_dir, payload)
@@ -531,37 +587,75 @@ def run_bakeoff(
 
         logger.info("[%s] Starting merge -> %s", method, merged_dir)
         merge_start = time.monotonic()
+        # Reuse the forward_fn's already-loaded base model for
+        # merge_and_unload — otherwise the dare_adamerging merge holds two
+        # full bf16 Qwen3-1.7B copies (~6.8 GB) plus DARE's fp32 upcast,
+        # which OOMs on a 40 GB A100. Safe because AdaMerging training has
+        # finished by the time merge_and_unload mutates the base in place.
+        extra_merge_kwargs: dict[str, Any] = {}
+        if method == "dare_adamerging" and adamerging_state is not None:
+            base_handle = adamerging_state.get("base_model")
+            if base_handle is not None:
+                extra_merge_kwargs["base_model"] = base_handle
         try:
-            merge_callable(
-                adapters_dir=args.adapters_dir,
-                method=method,
-                output_dir=merged_dir,
-                method_kwargs=method_kwargs,
-                base_model_repo=args.base_model,
-            )
-            merge_duration = time.monotonic() - merge_start
-            method_row = MethodRunRow(
-                method=method,
-                merge_status="ok",
-                merge_duration_seconds=merge_duration,
-                merged_dir=str(merged_dir),
-            )
-            logger.info("[%s] Merge succeeded in %.1fs", method, merge_duration)
-        except Exception:
-            merge_duration = time.monotonic() - merge_start
-            tb = traceback.format_exc()
-            logger.error("[%s] Merge FAILED after %.1fs:\n%s", method, merge_duration, tb)
-            method_row = MethodRunRow(
-                method=method,
-                merge_status="failed",
-                merge_duration_seconds=merge_duration,
-                merged_dir=str(merged_dir),
-                merge_error=tb,
-            )
-            payload.runs.append(method_row)
-            _write_bakeoff_results(args.output_dir, payload)
-            any_failed = True
-            continue
+            try:
+                merge_callable(
+                    adapters_dir=args.adapters_dir,
+                    method=method,
+                    output_dir=merged_dir,
+                    method_kwargs=method_kwargs,
+                    base_model_repo=args.base_model,
+                    **extra_merge_kwargs,
+                )
+                merge_duration = time.monotonic() - merge_start
+                method_row = MethodRunRow(
+                    method=method,
+                    merge_status="ok",
+                    merge_duration_seconds=merge_duration,
+                    merged_dir=str(merged_dir),
+                )
+                logger.info("[%s] Merge succeeded in %.1fs", method, merge_duration)
+            except Exception:
+                merge_duration = time.monotonic() - merge_start
+                tb = traceback.format_exc()
+                logger.error(
+                    "[%s] Merge FAILED after %.1fs:\n%s",
+                    method, merge_duration, tb,
+                )
+                method_row = MethodRunRow(
+                    method=method,
+                    merge_status="failed",
+                    merge_duration_seconds=merge_duration,
+                    merged_dir=str(merged_dir),
+                    merge_error=tb,
+                )
+                payload.runs.append(method_row)
+                _write_bakeoff_results(args.output_dir, payload)
+                any_failed = True
+                continue
+        finally:
+            # Release the AdaMerging base model BEFORE any eval runs, so
+            # vLLM gets the GPU to itself. Runs on both success and merge
+            # failure paths. merge_and_unload mutated the base in place,
+            # so even on success its weights are now baked-delta garbage
+            # that we must drop.
+            if adamerging_cleanup is not None:
+                try:
+                    adamerging_cleanup()
+                    logger.info(
+                        "[%s] Released AdaMerging forward_fn base model.",
+                        method,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] AdaMerging cleanup failed (continuing).",
+                        method,
+                    )
+                adamerging_state = None
+                adamerging_cleanup = None
+                gc.collect()
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Merge OK → sweep temperatures.
         for temperature in args.temperatures:
@@ -641,10 +735,17 @@ def _default_eval_callable(**kwargs: Any) -> dict[str, Any]:
 
 
 def _build_adamerging_state(args: argparse.Namespace) -> tuple[dict[str, Any], Callable[[], None]]:
-    """Build forward_fn + data_iter once for the whole sweep.
+    """Build forward_fn + data_iter just-in-time for dare_adamerging.
 
-    Returns ``(state_dict, cleanup_callable)``. The state dict is what
-    ``build_method_kwargs`` consumes for dare_adamerging.
+    Returns ``(state_dict, cleanup_callable)``. The state dict carries
+    ``forward_fn``, ``data_iter``, and the underlying ``base_model`` —
+    the last so the pipeline can reuse it for ``merge_and_unload`` instead
+    of allocating a second copy.
+
+    Called once per bake-off, immediately before the dare_adamerging
+    merge runs. ``cleanup_callable`` MUST be invoked immediately after
+    that merge returns; otherwise the ~3.4 GB base model stays resident
+    and starves subsequent vLLM evals.
     """
     from transformers import AutoTokenizer
 
@@ -656,7 +757,7 @@ def _build_adamerging_state(args: argparse.Namespace) -> tuple[dict[str, Any], C
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    forward_fn, cleanup = make_qwen3_forward(
+    forward_fn, cleanup, base_model = make_qwen3_forward(
         base_model_repo=args.base_model,
         device="cuda",
     )
@@ -667,7 +768,12 @@ def _build_adamerging_state(args: argparse.Namespace) -> tuple[dict[str, Any], C
         seed=ADAMERGING_BAKEOFF_CONFIG["seed"],
         device="cuda",
     )
-    return {"forward_fn": forward_fn, "data_iter": data_iter}, cleanup
+    state = {
+        "forward_fn": forward_fn,
+        "data_iter": data_iter,
+        "base_model": base_model,
+    }
+    return state, cleanup
 
 
 # ---------------------------------------------------------------------------
@@ -719,27 +825,17 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir,
     )
 
-    adamerging_state: dict[str, Any] | None = None
-    cleanup_adamerging: Callable[[], None] | None = None
+    adamerging_state_factory: Callable[[], tuple[dict[str, Any], Callable[[], None]]] | None = None
     if "dare_adamerging" in args.methods:
-        logger.info("Building AdaMerging forward_fn + data_iter ...")
-        adamerging_state, cleanup_adamerging = _build_adamerging_state(args)
+        adamerging_state_factory = lambda: _build_adamerging_state(args)
 
-    try:
-        payload, exit_code = run_bakeoff(
-            args,
-            merge_callable=_default_merge_callable,
-            eval_callable=_default_eval_callable,
-            config_factory=_default_config_factory,
-            adamerging_state=adamerging_state,
-        )
-    finally:
-        if cleanup_adamerging is not None:
-            try:
-                cleanup_adamerging()
-                logger.info("Released AdaMerging forward_fn base model.")
-            except Exception:
-                logger.exception("AdaMerging cleanup failed (continuing).")
+    payload, exit_code = run_bakeoff(
+        args,
+        merge_callable=_default_merge_callable,
+        eval_callable=_default_eval_callable,
+        config_factory=_default_config_factory,
+        adamerging_state_factory=adamerging_state_factory,
+    )
 
     print_summary(payload)
     return exit_code

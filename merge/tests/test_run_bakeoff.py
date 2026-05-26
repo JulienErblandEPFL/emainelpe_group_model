@@ -400,7 +400,7 @@ def test_run_bakeoff_happy_path_writes_results(tmp_path: Path) -> None:
         return _ok_benchmark_results()
 
     payload, code = bakeoff_mod.run_bakeoff(
-        args, stub_merger, stub_evaluator, _config_stub, adamerging_state=None,
+        args, stub_merger, stub_evaluator, _config_stub, adamerging_state_factory=None,
     )
 
     assert code == 0
@@ -446,7 +446,7 @@ def test_run_bakeoff_writes_incrementally_after_each_method(tmp_path: Path) -> N
     def stub_evaluator(**_kwargs: Any) -> dict[str, Any]:
         return _ok_benchmark_results()
 
-    bakeoff_mod.run_bakeoff(args, stub_merger, stub_evaluator, _config_stub, adamerging_state=None)
+    bakeoff_mod.run_bakeoff(args, stub_merger, stub_evaluator, _config_stub, adamerging_state_factory=None)
 
     assert snapshot_lengths == [0, 1]
 
@@ -476,7 +476,7 @@ def test_run_bakeoff_continues_after_merge_failure(tmp_path: Path) -> None:
         return _ok_benchmark_results()
 
     payload, code = bakeoff_mod.run_bakeoff(
-        args, stub_merger, stub_evaluator, _config_stub, adamerging_state=None,
+        args, stub_merger, stub_evaluator, _config_stub, adamerging_state_factory=None,
     )
 
     assert code == 1
@@ -514,7 +514,7 @@ def test_run_bakeoff_continues_after_one_temperature_fails(tmp_path: Path) -> No
         return _ok_benchmark_results()
 
     payload, code = bakeoff_mod.run_bakeoff(
-        args, stub_merger, stub_evaluator, _config_stub, adamerging_state=None,
+        args, stub_merger, stub_evaluator, _config_stub, adamerging_state_factory=None,
     )
 
     assert code == 1
@@ -548,7 +548,7 @@ def test_run_bakeoff_marks_dare_adamerging_failed_without_state(tmp_path: Path) 
         return _ok_benchmark_results()
 
     payload, code = bakeoff_mod.run_bakeoff(
-        args, stub_merger, stub_evaluator, _config_stub, adamerging_state=None,
+        args, stub_merger, stub_evaluator, _config_stub, adamerging_state_factory=None,
     )
 
     assert code == 1
@@ -599,3 +599,131 @@ def test_print_summary_includes_winner_line(capsys: pytest.CaptureFixture) -> No
     out = capsys.readouterr().out
     assert "Winner: uniform @ T=0.3" in out
     assert "0.750" in out
+
+
+# ---------------------------------------------------------------------------
+# run_bakeoff: adamerging state lifetime scoped to dare_adamerging merge
+# ---------------------------------------------------------------------------
+
+def test_run_bakeoff_adamerging_cleanup_runs_before_eval(tmp_path: Path) -> None:
+    """The forward_fn cleanup MUST fire BEFORE any eval for that method.
+
+    Regression for the 2026-05-26 starvation bug: forward_fn pinned
+    ~3.4 GB across the whole bake-off, so vLLM evals could not initialize
+    their engine. Cleanup must complete the moment the dare_adamerging
+    merge returns, before the first eval temperature runs.
+    """
+    args = _build_args(
+        tmp_path, methods=["dare_adamerging"], temperatures=[0.3, 0.5],
+    )
+
+    event_log: list[str] = []
+    factory_call_count = {"n": 0}
+
+    def factory() -> tuple[dict[str, Any], Any]:
+        factory_call_count["n"] += 1
+        event_log.append("factory_built")
+
+        def cleanup() -> None:
+            event_log.append("cleanup")
+
+        return {
+            "forward_fn": object(),
+            "data_iter": iter([]),
+            "base_model": object(),
+        }, cleanup
+
+    def stub_merger(**kwargs: Any) -> Path:
+        # base_model from the factory must reach merge_callable.
+        assert "base_model" in kwargs, "base_model must be forwarded for dare_adamerging"
+        event_log.append("merge")
+        kwargs["output_dir"].mkdir(parents=True, exist_ok=True)
+        return kwargs["output_dir"]
+
+    def stub_evaluator(**_kwargs: Any) -> dict[str, Any]:
+        event_log.append("eval")
+        return _ok_benchmark_results()
+
+    payload, code = bakeoff_mod.run_bakeoff(
+        args, stub_merger, stub_evaluator, _config_stub,
+        adamerging_state_factory=factory,
+    )
+
+    assert code == 0
+    assert factory_call_count["n"] == 1, "factory should be invoked exactly once"
+    # cleanup must appear between merge and the first eval.
+    assert event_log == [
+        "factory_built", "merge", "cleanup", "eval", "eval",
+    ], f"unexpected event ordering: {event_log}"
+
+
+def test_run_bakeoff_adamerging_cleanup_runs_on_merge_failure(tmp_path: Path) -> None:
+    """Cleanup must run even when the dare_adamerging merge raises."""
+    args = _build_args(
+        tmp_path, methods=["dare_adamerging", "uniform"], temperatures=[0.5],
+    )
+
+    event_log: list[str] = []
+
+    def factory() -> tuple[dict[str, Any], Any]:
+        event_log.append("factory_built")
+        return {
+            "forward_fn": object(),
+            "data_iter": iter([]),
+            "base_model": object(),
+        }, lambda: event_log.append("cleanup")
+
+    def stub_merger(**kwargs: Any) -> Path:
+        if kwargs["method"] == "dare_adamerging":
+            event_log.append("merge_raise")
+            raise RuntimeError("simulated OOM during AdaMerging merge")
+        event_log.append(f"merge_{kwargs['method']}")
+        kwargs["output_dir"].mkdir(parents=True, exist_ok=True)
+        return kwargs["output_dir"]
+
+    def stub_evaluator(**_kwargs: Any) -> dict[str, Any]:
+        event_log.append("eval")
+        return _ok_benchmark_results()
+
+    payload, code = bakeoff_mod.run_bakeoff(
+        args, stub_merger, stub_evaluator, _config_stub,
+        adamerging_state_factory=factory,
+    )
+
+    assert code == 1
+    # Cleanup MUST appear after the failed merge and before any subsequent
+    # method's merge — otherwise that next merge faces a starved GPU too.
+    assert "cleanup" in event_log
+    cleanup_idx = event_log.index("cleanup")
+    merge_raise_idx = event_log.index("merge_raise")
+    merge_uniform_idx = event_log.index("merge_uniform")
+    assert merge_raise_idx < cleanup_idx < merge_uniform_idx, (
+        f"cleanup must run between failed dare_adamerging merge and the next "
+        f"method's merge; got {event_log}"
+    )
+    # uniform must NOT receive a base_model kwarg from the adamerging state.
+    # (Sanity: the factory only feeds dare_adamerging.)
+    statuses = {r.method: r.merge_status for r in payload.runs}
+    assert statuses == {"dare_adamerging": "failed", "uniform": "ok"}
+
+
+def test_run_bakeoff_non_adamerging_method_does_not_invoke_factory(tmp_path: Path) -> None:
+    """Without dare_adamerging in the sweep, the factory must never run."""
+    args = _build_args(tmp_path, methods=["uniform"], temperatures=[0.3])
+
+    def factory() -> tuple[dict[str, Any], Any]:
+        raise AssertionError("factory should not be called without dare_adamerging")
+
+    def stub_merger(**kwargs: Any) -> Path:
+        assert "base_model" not in kwargs, "uniform must not receive base_model"
+        kwargs["output_dir"].mkdir(parents=True, exist_ok=True)
+        return kwargs["output_dir"]
+
+    def stub_evaluator(**_kwargs: Any) -> dict[str, Any]:
+        return _ok_benchmark_results()
+
+    _, code = bakeoff_mod.run_bakeoff(
+        args, stub_merger, stub_evaluator, _config_stub,
+        adamerging_state_factory=factory,
+    )
+    assert code == 0

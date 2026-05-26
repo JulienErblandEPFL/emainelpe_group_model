@@ -1110,3 +1110,97 @@ scorecards on the same 4 input adapters, in one run, with an aggregated
 - A "second-place" report (winner + 95% CI band on avg pass@8) would
   be useful for the final report. Out of scope here; can be added on
   top of `bakeoff_results.json` after the cluster smoke.
+
+---
+
+## Day 8 follow-up (2026-05-26) — bake-off GPU starvation fix
+
+### Symptom
+
+First real bake-off (2026-05-26, `loras/` × all 4 methods × 3
+temperatures) failed every single (method, temperature) combination:
+
+- `uniform`: merge OK, but all 3 vLLM evals raised
+  `Engine core initialization failed` — vLLM could not initialize
+  its engine because ~3.4 GB of GPU memory was held by an idle
+  forward_fn.
+- `dare_uniform`: merge failed instantly (1.2 s) — GPU saturated
+  before `load_all` could finish.
+- `dare_adamerging`: OOM at `merge/methods/dare.py:84` (the fp32
+  upcast in the DARE mask op). Two full Qwen3-1.7B copies plus the
+  DARE upcast exceeded 40 GB.
+- `ties`: merge OK, all 3 evals failed (same vLLM starvation).
+
+### Cause
+
+`scripts/run_bakeoff.py`'s Day 7-era design built the AdaMerging
+`forward_fn` (which loads + pins a full Qwen3-1.7B in GPU) ONCE at
+startup and held it through the entire bake-off via `main()`'s
+`try/finally`. The forward_fn is only actually consumed during the
+`dare_adamerging` MERGE (the AdaMerging training loop). It is NOT
+needed during any eval, nor during any other method's merge.
+Holding it for ~3.5 hours was wasted memory pressure on the GPU
+the whole time. vLLM's `Engine core initialization failed` was the
+visible failure, but the root cause was the static state lifetime.
+
+### Fix
+
+Three structural changes:
+
+1. **`run_bakeoff.py`**: replaced `adamerging_state: dict | None`
+   parameter with `adamerging_state_factory: Callable | None`. The
+   factory is invoked exactly ONCE, immediately before the
+   `dare_adamerging` merge. Its cleanup callable fires IMMEDIATELY
+   after that merge returns (success or failure) in a `finally`
+   block, before the first eval temperature runs. For every other
+   method (`uniform`, `dare_uniform`, `ties`) the factory is never
+   invoked and no forward_fn is resident.
+2. **`merge/qwen3_forward.py`**: strengthened `cleanup()` — it now
+   `gc.collect()` + `torch.cuda.empty_cache()` and logs CUDA
+   `memory_allocated()` before/after so a missed drop is visible
+   in the bake-off log. The return tuple was extended to
+   `(forward_fn, cleanup, base_model)` so the pipeline can reuse
+   the same base model for `merge_and_unload` instead of loading a
+   second copy.
+3. **`merge/pipeline.py`**: `merge_adapters` accepts an optional
+   `base_model=` parameter. When provided, the pipeline skips its
+   own `from_pretrained` (saving ~3.4 GB of duplicate allocation
+   during the `dare_adamerging` merge) and does NOT free the
+   externally-owned model in its finally block. Caller retains
+   ownership and is responsible for `cleanup`.
+
+### Why option (a) was safe for base-model reuse
+
+`merge.methods.adamerging.adamerging` uses `forward_fn` only inside
+its training loop. After the loop exits, the final merged tensor
+is recomputed under `torch.no_grad()` via `_compute_merged` — no
+forward pass needed. By the time control returns to `merge_adapters`
+and reaches `merge_and_unload`, the forward_fn is no longer in
+use. `merge_and_unload` mutates the base model in place (baking
+deltas into base weights), which is fine — AdaMerging training has
+finished, the model is otherwise about to be freed anyway.
+
+### Belt-and-suspenders
+
+The recommended bake-off launch now sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to reduce CUDA
+pool fragmentation across the multiple alloc/free cycles in one
+run. This is independent of the structural fix above but pairs
+well with it.
+
+### Verified (laptop)
+
+- `pytest merge/tests/test_run_bakeoff.py -v` — including 3 new
+  tests pinning the forward_fn lifetime: cleanup-before-eval on
+  success path, cleanup-on-merge-failure path, factory-never-invoked
+  for non-AdaMerging methods.
+- `pytest merge/tests/test_pipeline.py -v` — including 1 new test
+  pinning the `base_model=` reuse contract (cluster-only — gated by
+  CUDA).
+
+### To verify (cluster)
+
+Cluster re-run of the full bake-off is the next verification gate.
+Expected: forward_fn cleanup log line appears between the
+`dare_adamerging` merge and the first eval; subsequent vLLM evals
+succeed; total wall-clock similar to the Day 7 estimate (~3.5 h).

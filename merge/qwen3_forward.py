@@ -146,7 +146,7 @@ def make_qwen3_forward(
     base_model_repo: str = "Qwen/Qwen3-1.7B",
     device: str = "cuda",
     dtype=None,
-) -> tuple[Callable, Callable]:
+) -> tuple[Callable, Callable, "nn.Module"]:
     """Build a real-Qwen3 forward callable for AdaMerging.
 
     Loads ``base_model_repo`` once into ``device`` + ``dtype`` (default bf16),
@@ -155,8 +155,15 @@ def make_qwen3_forward(
 
     * ``forward_fn(merged, batch) -> logits``  — for
       :func:`merge.methods.adamerging.adamerging`.
-    * ``cleanup() -> None``  — drops the model reference so the GPU memory
-      can be freed by the next ``torch.cuda.empty_cache()`` or GC pass.
+    * ``cleanup() -> None``  — drops the model reference AND runs
+      ``gc.collect()`` + ``torch.cuda.empty_cache()`` so the memory is
+      actually returned to the CUDA pool (not just to Python's GC graph).
+      Idempotent.
+    * ``base_model``  — the loaded ``nn.Module``. Exposed so the caller
+      can reuse it for downstream ops (e.g. ``peft.merge_and_unload``)
+      instead of loading a second copy. The caller MUST call ``cleanup``
+      after it is done with the base model. After ``cleanup()`` the
+      returned ``base_model`` reference is no longer safe to use.
 
     Memory budget: Qwen3-1.7B in bf16 occupies ~3.4 GB. On an A100-40g this
     leaves ample headroom for activations and the 4 task vectors.
@@ -167,11 +174,12 @@ def make_qwen3_forward(
         dtype: Compute dtype. Defaults to ``torch.bfloat16``.
 
     Returns:
-        ``(forward_fn, cleanup)`` tuple.
+        ``(forward_fn, cleanup, base_model)`` tuple.
 
     Raises:
         RuntimeError: if ``device="cuda"`` is requested but unavailable.
     """
+    import gc
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -225,10 +233,30 @@ def make_qwen3_forward(
         return outputs.logits
 
     def cleanup() -> None:
-        """Release the model reference so its GPU memory can be freed."""
-        model_ref[0] = None
+        """Release the model and return its GPU memory to the CUDA pool.
 
-    return forward_fn, cleanup
+        Idempotent. Logs ``torch.cuda.memory_allocated()`` before and after
+        on CUDA so a missing drop is obvious in the bake-off log.
+        """
+        if model_ref[0] is None:
+            return
+        before = (
+            torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+        )
+        model_ref[0] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            after = torch.cuda.memory_allocated()
+            logger.info(
+                "make_qwen3_forward cleanup: cuda allocated %.2f GB -> %.2f GB "
+                "(freed %.2f GB)",
+                before / 1e9, after / 1e9, (before - after) / 1e9,
+            )
+        else:
+            logger.info("make_qwen3_forward cleanup: model released (CPU)")
+
+    return forward_fn, cleanup, model
 
 
 __all__ = ["make_qwen3_forward"]

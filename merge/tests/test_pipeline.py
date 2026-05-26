@@ -353,3 +353,60 @@ def test_pipeline_releases_gpu_memory_on_exception(
         locked_spec_path=lora_yaml_path,
     )
     assert (tmp_path / "second" / "config.json").exists()
+
+
+def test_pipeline_reuses_externally_provided_base_model(
+    qwen3_random_adapters_dir: Path, lora_yaml_path: Path, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``base_model=`` is provided, the pipeline must NOT call
+    ``AutoModelForCausalLM.from_pretrained`` (no second copy) and must
+    NOT free the externally-owned model in its finally block.
+
+    Regression for the 2026-05-26 starvation bug: the dare_adamerging
+    merge held two ~3.4 GB base copies (forward_fn's + pipeline's own)
+    which OOM'd on a 40 GB A100. The fix is to reuse the forward_fn's
+    base model. This test pins the no-double-load contract.
+    """
+    _skip_unless_cluster_ready()
+    import torch
+    from transformers import AutoModelForCausalLM
+    from merge.pipeline import merge_adapters
+
+    base = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-1.7B",
+        torch_dtype=torch.bfloat16,
+        device_map="cuda",
+    )
+
+    # Spy on from_pretrained: it must NOT be called by merge_adapters
+    # itself (we already loaded the base above).
+    call_count = {"n": 0}
+    original = AutoModelForCausalLM.from_pretrained
+
+    def spy(*args, **kwargs):
+        call_count["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        AutoModelForCausalLM, "from_pretrained", spy,
+    )
+
+    out_dir = tmp_path / "merged"
+    merge_adapters(
+        qwen3_random_adapters_dir,
+        method="uniform",
+        output_dir=out_dir,
+        locked_spec_path=lora_yaml_path,
+        base_model=base,
+    )
+
+    assert call_count["n"] == 0, (
+        f"from_pretrained must not be called when base_model is provided; "
+        f"got {call_count['n']} calls"
+    )
+    # The pipeline must not have set our local reference to a freed model:
+    # merge_and_unload mutates base in place, but the Python object still
+    # exists. (After cleanup the caller owns the now-baked-delta model.)
+    assert base is not None
+    _assert_full_model_output(out_dir)
