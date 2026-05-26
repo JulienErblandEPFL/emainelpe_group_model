@@ -1474,3 +1474,103 @@ With dare() fixed, the cluster can re-run `dare_uniform` and
 seeds) and complete the 4-method comparison for the final report.
 The ties @ T=0.5 winner identified in the partial bake-off does NOT
 need re-validation — DARE only affected the failed runs.
+
+---
+
+## Day 8 follow-up #4 (2026-05-26) — dare() now mutates in place
+
+### Symptom
+
+After the bf16 fix (follow-up #3), `dare_uniform` STILL OOM'd on a
+verified-clean A100-40g (4 MiB used at launch, no co-tenant, no
+forward_fn). The OOM line moved from the old fp32 upcast at dare.py:84
+to the output-dict write at dare.py:97:
+
+    out[name] = tensor * mask * rescale_factor
+    torch.OutOfMemoryError
+
+### Root cause
+
+`dare()`'s non-mutating contract built a FRESH output dict alongside
+the input. The 4 input task vectors total ~12 GB (per-adapter ΔW ≈
+3 GB across 196 target modules); the output dict adds another ~12 GB
+on top. Add mask + intermediate (~3-6 GB during the loop, plus CUDA
+caching-allocator fragmentation across 196 alloc/free cycles per
+adapter) and the 40 GB ceiling falls over.
+
+The non-mutating contract is correct for general-purpose callers but
+unnecessary for the merge composers — the pipeline never re-reads
+the originals after `merge_fn` returns. So the duplication was paying
+for an invariant nobody actually needed.
+
+### Fix
+
+Added `inplace: bool = False` to `dare()`. Default preserves the
+historical non-mutating contract (and the existing
+``test_dare_does_not_modify_input`` test). When `True`:
+
+    if inplace:
+        tensor.mul_(mask)
+        if rescale_factor != 1.0:
+            tensor.mul_(rescale_factor)
+
+No new output tensor is allocated. The mask itself is still
+allocated per-iteration but `del mask` after use makes that one bf16
+allocation reclaimable; only one mask is resident at a time, not 196.
+
+`dare_uniform`, `dare_weighted`, and `dare_adamerging` all pass
+`inplace=True`. Pipeline-side: `merge_adapters` does
+`task_vectors = list(adapters_by_domain.values())` and passes the
+list to `merge_fn` — after which `merged.items()` is the only
+consumer. So mutation is safe.
+
+### What this saves
+
+Before: 4 inputs (~12 GB) + 4 outputs (~12 GB) + per-iteration
+mask/intermediate (~few GB) ≈ 24-28 GB peak before considering
+fragmentation. With fragmentation the actual allocator footprint
+pushed past 40 GB.
+
+After: 4 inputs (mutated in place, still ~12 GB) + one mask resident
+at a time (~few hundred MB) ≈ 12-13 GB peak.
+
+### What this does NOT solve
+
+If the 4 input task vectors alone exceeded 40 GB — say a future
+model with larger hidden size — no amount of in-place trickery
+would help. The acceptable non-fix in the task spec applies for that
+case: document the limitation and move on. For Qwen3-1.7B the
+in-place fix should be enough; cluster re-run is the gate.
+
+### Task 3 (incremental free) — skipped
+
+The pipeline holds the inputs via two references: `adapters_by_domain`
+(the dict) AND `task_vectors` (the list). Popping the list from
+inside `dare_uniform` would not free GPU memory because
+`adapters_by_domain` still pins every tensor. Plumbing a
+"consume + free" signal back to `merge_adapters` so it could drop
+`adapters_by_domain[domain]` entries crosses the merge-method
+abstraction boundary for marginal benefit. In-place mutation alone
+removes the duplication that was the actual cause; incremental free
+would only matter if 4 task vectors alone exceeded the budget.
+
+### Tests
+
+- `test_dare_does_not_modify_input` (default `inplace=False`): passes
+  unchanged.
+- `test_dare_uniform_reproducible_with_seed` and
+  `test_dare_weighted_reproducible_with_seed` (compositions test):
+  updated to load tvs fresh per call, matching the real pipeline
+  flow (which always calls `load_all` fresh before `merge_fn`).
+  Quoting the diff intent: "dare_uniform applies DARE in-place to
+  save GPU memory, so re-using the same dict object would feed
+  already-masked inputs into the second call."
+- New `test_dare.py` tests for the inplace path: mutates-input
+  contract, identical results as non-inplace for the same seed,
+  rescale preserves mean magnitude, dtype preservation.
+
+### What this unblocks
+
+Same as follow-up #3: `dare_uniform` and `dare_adamerging` can be
+re-run on the cluster to complete the 4-method comparison for the
+final report. The ties @ T=0.5 winner stands.

@@ -205,6 +205,81 @@ def test_dare_does_not_modify_input() -> None:
 
 
 # ---------------------------------------------------------------------------
+# inplace=True: opt-in mutation that halves peak memory
+# ---------------------------------------------------------------------------
+
+def test_dare_inplace_mutates_input_and_returns_same_dict() -> None:
+    """``inplace=True`` mutates each tensor in place and returns the same dict.
+
+    Regression for the 2026-05-26 dare_uniform OOM on a clean A100-40g:
+    even after the fp32→bf16 fix, allocating a fresh output dict on top
+    of the 4 ~3 GB input task vectors exceeded the budget. ``inplace=True``
+    eliminates the duplication; the merge composers
+    (``dare_uniform``/``dare_weighted``/``dare_adamerging``) opt into it
+    since the pipeline never re-reads originals after the merge_fn returns.
+    """
+    torch = pytest.importorskip("torch")
+    from merge.methods.dare import dare
+
+    tv = _make_random_tv(seed=0)
+    snapshots = {k: v.clone() for k, v in tv.items()}
+    tensor_ids_before = {k: id(v) for k, v in tv.items()}
+
+    out = dare(tv, drop_rate=0.5, seed=0, inplace=True)
+
+    # The returned dict IS the input dict (same Python object).
+    assert out is tv, "inplace=True must return the same dict object"
+    # Tensors are mutated (different from snapshot) — drop_rate=0.5 means
+    # at least some entries should be zeroed.
+    for key in tv:
+        # Same tensor object: in-place mutation preserves id.
+        assert id(tv[key]) == tensor_ids_before[key], (
+            f"{key}: in-place must not replace the tensor object"
+        )
+        differs = not torch.equal(tv[key], snapshots[key])
+        assert differs, f"{key}: inplace=True did not mutate the tensor"
+
+
+def test_dare_inplace_drop_ratio_matches_non_inplace() -> None:
+    """The masking math is identical between inplace=True and the default path."""
+    torch = pytest.importorskip("torch")
+    from merge.methods.dare import dare
+
+    tv = _make_random_tv(seed=0, shape=(64, 64))
+    tv_inplace = {k: v.clone() for k, v in tv.items()}
+
+    non_inplace = dare(tv, drop_rate=0.5, seed=42, inplace=False)
+    dare(tv_inplace, drop_rate=0.5, seed=42, inplace=True)
+
+    for key in tv:
+        # Same seed + same dict iteration order → same masks → identical results.
+        assert torch.equal(non_inplace[key], tv_inplace[key]), (
+            f"{key}: inplace and non-inplace differ for the same seed"
+        )
+
+
+def test_dare_inplace_rescale_preserves_mean_magnitude() -> None:
+    """All-ones input with rescale=True, inplace=True → mean ≈ 1.0."""
+    torch = pytest.importorskip("torch")
+    from merge.methods.dare import dare
+
+    tv = {"a": torch.ones(64, 64, dtype=torch.bfloat16)}
+    dare(tv, drop_rate=0.5, rescale=True, seed=7, inplace=True)
+    observed = tv["a"].float().mean().item()
+    assert abs(observed - 1.0) < 0.05, f"mean={observed!r}, expected ≈ 1.0"
+
+
+def test_dare_inplace_preserves_dtype() -> None:
+    torch = pytest.importorskip("torch")
+    from merge.methods.dare import dare
+
+    tv = _make_random_tv(seed=0)
+    dare(tv, drop_rate=0.3, seed=0, inplace=True)
+    for tensor in tv.values():
+        assert tensor.dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
 # Argument validation
 # ---------------------------------------------------------------------------
 

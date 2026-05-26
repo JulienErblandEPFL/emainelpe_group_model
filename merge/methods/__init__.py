@@ -62,8 +62,16 @@ def dare_uniform(
     Returns:
         Merged task vector dict.
     """
+    # ``inplace=True``: the pipeline never re-reads the originals after
+    # the merge_fn returns, and the input+output duplication of the
+    # default path was the cause of the 2026-05-26 OOM on a clean A100.
     masked = [
-        dare(tv, drop_rate, seed=(None if seed is None else seed + i), rescale=rescale)
+        dare(
+            tv, drop_rate,
+            seed=(None if seed is None else seed + i),
+            rescale=rescale,
+            inplace=True,
+        )
         for i, tv in enumerate(task_vectors)
     ]
     return uniform_merge(masked)
@@ -92,8 +100,14 @@ def dare_weighted(
     Returns:
         Merged task vector dict.
     """
+    # See ``dare_uniform`` for the in-place rationale.
     masked = [
-        dare(tv, drop_rate, seed=(None if seed is None else seed + i), rescale=rescale)
+        dare(
+            tv, drop_rate,
+            seed=(None if seed is None else seed + i),
+            rescale=rescale,
+            inplace=True,
+        )
         for i, tv in enumerate(task_vectors)
     ]
     return weighted_linear_merge(masked, weights)
@@ -140,8 +154,16 @@ def dare_adamerging(
         :class:`~merge.methods.adamerging.AdaMergingResult` for
         consistency with the other methods in ``METHOD_REGISTRY``).
     """
+    # See ``dare_uniform`` for the in-place rationale. AdaMerging reads
+    # the dared list across training steps but never re-reads the
+    # originals, so mutating them is safe.
     dared = [
-        dare(tv, drop_rate, seed=(None if seed is None else seed + i), rescale=rescale)
+        dare(
+            tv, drop_rate,
+            seed=(None if seed is None else seed + i),
+            rescale=rescale,
+            inplace=True,
+        )
         for i, tv in enumerate(task_vectors)
     ]
 
