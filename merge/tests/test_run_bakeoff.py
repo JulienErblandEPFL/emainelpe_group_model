@@ -630,12 +630,16 @@ def test_run_bakeoff_adamerging_cleanup_runs_before_eval(tmp_path: Path) -> None
         return {
             "forward_fn": object(),
             "data_iter": iter([]),
-            "base_model": object(),
         }, cleanup
 
     def stub_merger(**kwargs: Any) -> Path:
-        # base_model from the factory must reach merge_callable.
-        assert "base_model" in kwargs, "base_model must be forwarded for dare_adamerging"
+        # base_model must NOT be forwarded — that's the bug we're fixing.
+        # merge_adapters always loads its own base; passing a handle from
+        # the state dict creates a dangling reference that defeats cleanup.
+        assert "base_model" not in kwargs, (
+            "base_model must NOT be forwarded; it creates a dangling reference "
+            "that prevents forward_fn cleanup from freeing GPU memory"
+        )
         event_log.append("merge")
         kwargs["output_dir"].mkdir(parents=True, exist_ok=True)
         return kwargs["output_dir"]
@@ -670,7 +674,6 @@ def test_run_bakeoff_adamerging_cleanup_runs_on_merge_failure(tmp_path: Path) ->
         return {
             "forward_fn": object(),
             "data_iter": iter([]),
-            "base_model": object(),
         }, lambda: event_log.append("cleanup")
 
     def stub_merger(**kwargs: Any) -> Path:

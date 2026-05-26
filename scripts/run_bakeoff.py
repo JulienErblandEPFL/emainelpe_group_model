@@ -587,16 +587,12 @@ def run_bakeoff(
 
         logger.info("[%s] Starting merge -> %s", method, merged_dir)
         merge_start = time.monotonic()
-        # Reuse the forward_fn's already-loaded base model for
-        # merge_and_unload — otherwise the dare_adamerging merge holds two
-        # full bf16 Qwen3-1.7B copies (~6.8 GB) plus DARE's fp32 upcast,
-        # which OOMs on a 40 GB A100. Safe because AdaMerging training has
-        # finished by the time merge_and_unload mutates the base in place.
-        extra_merge_kwargs: dict[str, Any] = {}
-        if method == "dare_adamerging" and adamerging_state is not None:
-            base_handle = adamerging_state.get("base_model")
-            if base_handle is not None:
-                extra_merge_kwargs["base_model"] = base_handle
+        # merge_adapters loads its own base for merge_and_unload. We do
+        # NOT pass the forward_fn's base model: doing so creates a
+        # dangling external reference that defeats cleanup() (the
+        # 2026-05-26 "freed 0.00 GB" bug). The mem-probe showed
+        # merge_adapters peaks at ~5.82 GB reserved and reclaims fully —
+        # 2× residency (~3.46 + ~6 ≈ 9.5 GB) fits in 40 GB.
         try:
             try:
                 merge_callable(
@@ -605,7 +601,6 @@ def run_bakeoff(
                     output_dir=merged_dir,
                     method_kwargs=method_kwargs,
                     base_model_repo=args.base_model,
-                    **extra_merge_kwargs,
                 )
                 merge_duration = time.monotonic() - merge_start
                 method_row = MethodRunRow(
@@ -656,6 +651,10 @@ def run_bakeoff(
                 gc.collect()
                 if torch is not None and torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    logger.info(
+                        "[%s] GPU after forward_fn cleanup: %.2f GB allocated",
+                        method, torch.cuda.memory_allocated() / 1e9,
+                    )
 
         # Merge OK → sweep temperatures.
         for temperature in args.temperatures:
@@ -757,7 +756,7 @@ def _build_adamerging_state(args: argparse.Namespace) -> tuple[dict[str, Any], C
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    forward_fn, cleanup, base_model = make_qwen3_forward(
+    forward_fn, cleanup = make_qwen3_forward(
         base_model_repo=args.base_model,
         device="cuda",
     )
@@ -768,10 +767,14 @@ def _build_adamerging_state(args: argparse.Namespace) -> tuple[dict[str, Any], C
         seed=ADAMERGING_BAKEOFF_CONFIG["seed"],
         device="cuda",
     )
+    # State carries ONLY forward_fn + data_iter. Holding the raw base
+    # model here would create a dangling reference that defeats cleanup()
+    # — fixed in the Day 8 follow-up #2 after the 2026-05-26 bake-off
+    # logged "freed 0.00 GB" because state["base_model"] kept the module
+    # alive past the cleanup nulling its closure box.
     state = {
         "forward_fn": forward_fn,
         "data_iter": data_iter,
-        "base_model": base_model,
     }
     return state, cleanup
 

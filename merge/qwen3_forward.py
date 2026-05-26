@@ -146,7 +146,7 @@ def make_qwen3_forward(
     base_model_repo: str = "Qwen/Qwen3-1.7B",
     device: str = "cuda",
     dtype=None,
-) -> tuple[Callable, Callable, "nn.Module"]:
+) -> tuple[Callable, Callable]:
     """Build a real-Qwen3 forward callable for AdaMerging.
 
     Loads ``base_model_repo`` once into ``device`` + ``dtype`` (default bf16),
@@ -159,11 +159,17 @@ def make_qwen3_forward(
       ``gc.collect()`` + ``torch.cuda.empty_cache()`` so the memory is
       actually returned to the CUDA pool (not just to Python's GC graph).
       Idempotent.
-    * ``base_model``  — the loaded ``nn.Module``. Exposed so the caller
-      can reuse it for downstream ops (e.g. ``peft.merge_and_unload``)
-      instead of loading a second copy. The caller MUST call ``cleanup``
-      after it is done with the base model. After ``cleanup()`` the
-      returned ``base_model`` reference is no longer safe to use.
+
+    Critical: the raw ``nn.Module`` is intentionally NOT exposed. The
+    closure box ``model_ref`` holds the only strong reference; nulling
+    that box in ``cleanup`` truly drops the model. A previous version
+    returned the model as a third tuple element so callers could reuse
+    it for ``merge_and_unload`` — that reuse created a dangling external
+    reference, so ``cleanup`` could nuke ``model_ref[0]`` but the model
+    stayed alive in the caller's state, and ``empty_cache`` freed nothing
+    (observed: "freed 0.00 GB" on the 2026-05-26 bake-off). Reuse fixed
+    a non-problem (2× ~3.4 GB base residency fits comfortably in a 40 GB
+    A100) at the cost of correctness, so it was removed.
 
     Memory budget: Qwen3-1.7B in bf16 occupies ~3.4 GB. On an A100-40g this
     leaves ample headroom for activations and the 4 task vectors.
@@ -174,7 +180,7 @@ def make_qwen3_forward(
         dtype: Compute dtype. Defaults to ``torch.bfloat16``.
 
     Returns:
-        ``(forward_fn, cleanup, base_model)`` tuple.
+        ``(forward_fn, cleanup)`` tuple.
 
     Raises:
         RuntimeError: if ``device="cuda"`` is requested but unavailable.
@@ -214,6 +220,10 @@ def make_qwen3_forward(
         )
 
     model_ref: list = [model]  # box so cleanup() can null it
+    # Drop the local strong reference: the closure box is now the only
+    # path to the model. If we leave `model` bound in this frame, any
+    # cycle through `model_ref` would still pin the module after cleanup.
+    del model
 
     def forward_fn(merged, batch):
         """Run the base model with merged ΔW patched in, return logits.
@@ -256,7 +266,7 @@ def make_qwen3_forward(
         else:
             logger.info("make_qwen3_forward cleanup: model released (CPU)")
 
-    return forward_fn, cleanup, model
+    return forward_fn, cleanup
 
 
 __all__ = ["make_qwen3_forward"]

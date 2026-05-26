@@ -1204,3 +1204,88 @@ Cluster re-run of the full bake-off is the next verification gate.
 Expected: forward_fn cleanup log line appears between the
 `dare_adamerging` merge and the first eval; subsequent vLLM evals
 succeed; total wall-clock similar to the Day 7 estimate (~3.5 h).
+
+---
+
+## Day 8 follow-up #2 (2026-05-26) — base_model reuse CAUSED a freed-0.00-GB leak
+
+### Symptom (revisited)
+
+After the Day 8 follow-up #1 fix (scoping forward_fn to the
+dare_adamerging merge), the next cluster bake-off still failed every
+(method, temperature). The bake-off log this time included an
+unambiguous diagnostic from the new cleanup logger:
+
+    make_qwen3_forward cleanup: cuda allocated 3.46 GB -> 3.46 GB (freed 0.00 GB)
+
+`empty_cache()` reclaimed nothing because the model was still strongly
+referenced *somewhere else* when cleanup nulled its closure box.
+
+### Root cause
+
+The Day 8 follow-up #1 fix exposed the loaded base model as a third
+tuple element from `make_qwen3_forward` and threaded it through
+`state["base_model"]` into `merge_adapters(base_model=...)` for reuse.
+That was an attempt to dodge a 2× residency cost (forward_fn's base +
+merge_adapters' own base, ~6.8 GB peak) during the dare_adamerging
+merge. The side effect: `cleanup()` nulling `model_ref[0]` no longer
+dropped the last reference — the state dict still held one. So
+`empty_cache()` saw the allocator still holding 3.46 GB of live tensors
+and freed nothing. The leak compounded across methods until vLLM had no
+room for its engine and the OOM cascade began.
+
+### Mem-probe evidence
+
+A pre-fix mem probe showed `merge_adapters` is internally clean:
+peaks at ~5.82 GB reserved, returns to ~0.01 GB allocated after its
+finally block. So 2× residency was never the real concern — the
+hypothetical worst case (~3.46 + ~6 ≈ 9.5 GB) fits comfortably in
+40 GB. The reuse solved a non-problem and introduced a correctness bug.
+
+### Fix
+
+1. **`make_qwen3_forward`** now returns a 2-tuple `(forward_fn, cleanup)`.
+   The raw model is not exposed. The local `model` binding inside
+   `make_qwen3_forward` is `del`'d after wrapping it in the closure
+   box, so the box is the only strong reference. Cleanup nulling it
+   genuinely drops the last reference.
+2. **`merge_adapters`** lost the `base_model=` parameter. It always
+   loads its own base for `merge_and_unload`.
+3. **`scripts/run_bakeoff.py`** stops capturing the raw model in
+   `state` and stops forwarding `base_model=` into `merge_adapters`.
+   A new log line after cleanup —
+   `[%s] GPU after forward_fn cleanup: %.2f GB allocated` —
+   makes the drop visible in the next cluster log.
+
+### Verified (laptop)
+
+- `pytest merge/tests/test_qwen3_forward.py -v` — new file. The
+  weakref test would have caught this bug before deployment: it
+  monkey-patches `from_pretrained` with a tiny stub, takes a
+  `weakref.ref` to the model, calls cleanup, and asserts the ref is
+  dead.
+- `pytest merge/tests/test_pipeline.py -v` — the cluster-only
+  `test_pipeline_reuses_externally_provided_base_model` test was
+  replaced with a laptop-runnable test asserting `merge_adapters`
+  rejects a `base_model=` kwarg (the parameter is gone).
+- `pytest merge/tests/test_run_bakeoff.py -v` — the two cleanup-lifetime
+  tests were flipped: they now assert `base_model` is NOT in
+  `merge_callable`'s kwargs and that the state dict contains only
+  `forward_fn` + `data_iter`.
+
+### Lesson
+
+When you add a parameter purely to avoid a hypothesized memory cost,
+verify the cost is real first. A mem-probe takes 10 minutes; the
+follow-up fix took longer than the original.
+
+### To verify (cluster)
+
+Cluster re-run is the gate. Expected log line after the
+dare_adamerging merge:
+
+    make_qwen3_forward cleanup: cuda allocated 3.46 GB -> 0.X GB (freed 3.4X GB)
+    [dare_adamerging] GPU after forward_fn cleanup: 0.X GB allocated
+
+If the freed value is still ~0.00 GB, another dangling reference
+exists and the search continues.
