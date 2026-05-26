@@ -141,6 +141,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max tokens per completion (default 2048; CI ceiling is 16384).",
     )
     parser.add_argument("--seed", type=int, default=42, help="vLLM sampling seed (default 42).")
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.6,
+        help=(
+            "Fraction of GPU memory vLLM may use on startup (default 0.6). "
+            "Lower if a co-tenant or transient residue is causing "
+            "'Free memory ... less than desired ...' on engine init."
+        ),
+    )
     return parser
 
 
@@ -193,6 +203,10 @@ def validate_args(args: argparse.Namespace) -> list[str]:
         errors.append(f"--top-p must be in (0, 1], got {args.top_p}")
     if args.top_k < 1:
         errors.append(f"--top-k must be >= 1, got {args.top_k}")
+    if not (0.0 < args.gpu_memory_utilization <= 1.0):
+        errors.append(
+            f"--gpu-memory-utilization must be in (0, 1], got {args.gpu_memory_utilization}"
+        )
 
     return errors
 
@@ -298,6 +312,7 @@ def run_sweep(
                 validation_samples_dir=args.validation_samples_dir,
                 chat_template_path=args.chat_template_path,
                 config=config,
+                gpu_memory_utilization=float(args.gpu_memory_utilization),
             )
             duration = time.monotonic() - start
             row = _benchmark_results_to_row(temperature, duration, results)

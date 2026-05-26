@@ -228,6 +228,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=2048, help="Max tokens per completion.")
     parser.add_argument("--seed", type=int, default=42, help="vLLM sampling seed.")
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.6,
+        help=(
+            "Fraction of GPU memory vLLM may use on startup (default 0.6). "
+            "Lower if cluster contention causes 'Free memory ... less than "
+            "desired ...' on engine init. The 2026-05-26 bake-off failed every "
+            "eval at the vLLM default 0.9 because ~24 GB was needed free."
+        ),
+    )
+    parser.add_argument(
         "--adamerging-max-steps",
         type=int,
         default=ADAMERGING_BAKEOFF_CONFIG["max_steps"],
@@ -292,6 +303,11 @@ def validate_args(args: argparse.Namespace) -> list[str]:
     if args.adamerging_max_steps < 1:
         errors.append(
             f"--adamerging-max-steps must be >= 1, got {args.adamerging_max_steps}"
+        )
+    if not (0.0 < args.gpu_memory_utilization <= 1.0):
+        errors.append(
+            f"--gpu-memory-utilization must be in (0, 1], got "
+            f"{args.gpu_memory_utilization}"
         )
 
     return errors
@@ -673,6 +689,7 @@ def run_bakeoff(
                     validation_samples_dir=args.validation_samples_dir,
                     chat_template_path=args.chat_template_path,
                     config=config,
+                    gpu_memory_utilization=float(args.gpu_memory_utilization),
                 )
                 duration = time.monotonic() - eval_start
                 tr = _temperature_row_from_results(temperature, duration, results)

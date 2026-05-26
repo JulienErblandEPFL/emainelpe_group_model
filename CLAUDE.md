@@ -108,6 +108,11 @@ entirely.
   outputs aggregated `bakeoff_results.json` + per-(method, temperature)
   eval subdirs; per-(method, temperature) failures isolated). Launch:
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python -u scripts/run_bakeoff.py --adapters-dir loras/ --output-dir bakeoff_<date>/ > bakeoff.log 2>&1 &`.
+  `--gpu-memory-utilization` (default 0.6) caps vLLM's startup request
+  to ~24 GB on a 40 GB A100; lower further (e.g. 0.45) if a co-tenant
+  causes "Free memory ... less than desired ..." on engine init. vLLM's
+  own default (0.9) demanded ~35 GB free and was the 2026-05-26 eval
+  failure mode.
   The `PYTORCH_CUDA_ALLOC_CONF` env var reduces fragmentation across the
   multiple base-model alloc/free cycles in one bake-off — pair with the
   Day 8 follow-up that scopes the AdaMerging forward_fn to the

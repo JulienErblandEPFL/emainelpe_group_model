@@ -323,6 +323,58 @@ def evaluate_one_benchmark(
     return result, failures
 
 
+def _shutdown_vllm(llm: Any) -> None:
+    """Best-effort teardown of a vLLM ``LLM`` instance.
+
+    vLLM V1 spawns an EngineCore subprocess that may not die when the
+    Python object is GC'd, leaving GPU memory pinned for the next call.
+    This helper walks a list of known shutdown entry points across vLLM
+    versions and calls each one if present. Every call is wrapped in
+    try/except — the API surface shifts version-to-version and we
+    prefer "best effort" over "crash the bake-off if vLLM renamed a
+    method".
+
+    Sequence:
+      1. Try ``llm.llm_engine.engine_core.shutdown()`` (V1 EngineCore).
+      2. Try ``destroy_model_parallel`` + ``destroy_distributed_environment``
+         from ``vllm.distributed.parallel_state`` — stable API across
+         many versions, used internally by vLLM's own ``cleanup_dist_env_and_memory``.
+
+    The caller still ``del``s the reference, gc-collects, and runs
+    ``torch.cuda.empty_cache()`` afterward.
+    """
+    if llm is None:
+        return
+
+    # 1. V1 EngineCore subprocess. Path: LLM -> llm_engine -> engine_core.
+    # Method name varies by version — try a few; any that fail are
+    # silently skipped.
+    try:
+        engine = getattr(llm, "llm_engine", None)
+        if engine is not None:
+            engine_core = getattr(engine, "engine_core", None)
+            if engine_core is not None and hasattr(engine_core, "shutdown"):
+                engine_core.shutdown()
+    except Exception:
+        logger.debug("vLLM engine_core.shutdown() unavailable or raised", exc_info=True)
+
+    # 2. Distributed parallel state. These are public APIs in
+    # vllm.distributed.parallel_state and have existed since at least
+    # vLLM 0.5 — wrapping in try/except in case a future version moves them.
+    try:
+        from vllm.distributed.parallel_state import (
+            destroy_model_parallel,
+            destroy_distributed_environment,
+        )
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    except Exception:
+        logger.debug(
+            "vllm.distributed.parallel_state destroy helpers unavailable",
+            exc_info=True,
+        )
+
+
 def evaluate_all_benchmarks(
     merged_adapter_dir: Path,
     base_model_repo: str,
@@ -331,6 +383,7 @@ def evaluate_all_benchmarks(
     chat_template_path: Path | None = None,
     config: InferenceConfig | None = None,
     repo_root: Path | None = None,
+    gpu_memory_utilization: float = 0.6,
 ) -> dict[str, BenchmarkResult]:
     """Top-level orchestrator. Loads vLLM once, runs all 4 benchmarks.
 
@@ -355,6 +408,14 @@ def evaluate_all_benchmarks(
             ``repo_root/generation_config.json`` → Qwen3 defaults.
         repo_root: Optional override for the repo-root fallback lookup. If
             ``None``, derived from this module's file path.
+        gpu_memory_utilization: Fraction of GPU memory vLLM may use on
+            startup (default 0.6 — vLLM needs ~24 GB free on a 40 GB A100,
+            leaving ~16 GB buffer against transient contention or
+            co-tenant residue). The vLLM default of 0.9 was the root
+            cause of the 2026-05-26 bake-off eval failures
+            (``Free memory ... 33.22/39.49 GiB ... less than desired ...
+            35.54 GiB``) — at 3.4 GB the merged Qwen3-1.7B + KV cache for
+            our small batches needs far less.
 
     Returns:
         ``{benchmark_name: BenchmarkResult}`` for the 4 canonical domains.
@@ -388,13 +449,24 @@ def evaluate_all_benchmarks(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if not 0.0 < gpu_memory_utilization <= 1.0:
+        raise ValueError(
+            f"gpu_memory_utilization must be in (0, 1], got {gpu_memory_utilization}"
+        )
+
     # Lazy import — vllm pulls CUDA and is ~10s to import.
+    import gc
+
     from vllm import LLM
 
-    logger.info("Loading vLLM with full merged model at %s", merged_adapter_dir)
+    logger.info(
+        "Loading vLLM with full merged model at %s (gpu_memory_utilization=%.2f)",
+        merged_adapter_dir, gpu_memory_utilization,
+    )
     llm = LLM(
         model=str(merged_adapter_dir),
         dtype="bfloat16",
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     results: dict[str, BenchmarkResult] = {}
@@ -415,10 +487,17 @@ def evaluate_all_benchmarks(
             )
             results[benchmark] = result
     finally:
+        _shutdown_vllm(llm)
+        llm = None  # type: ignore[assignment]
+        gc.collect()
         try:
-            del llm
             import torch
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info(
+                    "vLLM teardown: cuda allocated %.2f GB after empty_cache",
+                    torch.cuda.memory_allocated() / 1e9,
+                )
         except Exception:  # pragma: no cover — cleanup is best-effort
             pass
 
