@@ -1289,3 +1289,86 @@ dare_adamerging merge:
 
 If the freed value is still ~0.00 GB, another dangling reference
 exists and the search continues.
+
+---
+
+## Day 8 (2026-05-26) — bake-off results + Stage 5d publish
+
+### Bake-off outcome
+
+After the two follow-ups (forward_fn lifetime scope, then the
+`base_model` reuse removal + 0.6 GPU utilization cap), the bake-off
+ran end-to-end. Headline:
+
+| method            | T   | avg pass@8 | notes |
+|-------------------|-----|------------|-------|
+| **ties**          | 0.5 | **0.700**  | **winner** |
+| uniform           | varies | < ties | clean run, baseline behavior |
+| dare_uniform      | —   | OOM    | fp32 upcast in `merge/methods/dare.py:84` |
+| dare_adamerging   | —   | OOM    | same upcast, plus AdaMerging training overhead |
+
+**n=10 problems per benchmark caveat**: pass@8 over 10 problems is a
+small-sample estimator. Treat ranks as indicative, not definitive. The
+ties win was robust across all 4 benchmarks (no single domain carrying
+the average) which is what we wanted from a merge method.
+
+dare_uniform / dare_adamerging both OOM'd at the same line —
+`dare.py:84` upcasts the mask op to fp32 inside the merge loop,
+peaking GPU memory above the budget left after the 3.46 GB base load.
+Fix deferred to Stage 6 (use bf16 mask op, or chunk the upcast); the
+ties result is sufficient for the Milestone 2 push.
+
+### Stage 5d: `scripts/publish.py`
+
+The course CI grades by loading the *uploaded* model's
+`generation_config.json`. The bake-off scored ties under
+`temperature=0.5, top_p=0.8, top_k=20, max_new_tokens=2048`, but the
+merged dir's bundled config is whatever
+`merge_and_unload`/`save_pretrained` left there (Qwen3 defaults =
+0.7 / 0.8 / 20 / 16384). If we push as-is, CI grades under different
+sampling than the bake-off validated. So publish MUST rewrite the
+config to the winning params.
+
+Implementation:
+
+- `scripts/publish.py` is a thin CLI: validate model dir → build the
+  winning `generation_config.json` via
+  `merge.generation_config.make_generation_config` → print the upload
+  plan (repo, every file + size, total, the full new gen config) →
+  if not `--confirm`, exit; if `--confirm`, back up the existing
+  `generation_config.json` → `.bak`, write the new one, call
+  `HfApi().create_repo(exist_ok=True)` + `upload_folder`.
+- **Dry-run by default**: `--confirm` is required to push. Without
+  it the script never modifies the model directory and never touches
+  the Hub. A 3.4 GB push to the wrong repo is expensive and
+  embarrassing, so the safe path is the default.
+- `--repo-id` is required, no default. The intended slug is
+  `cs-552-2026-emainelpe/group_model` but the user must type it.
+- `merge/publish.py`'s `publish_adapter` stub is left in place —
+  it predates the Day 7 LoRA → full-model refactor and is no longer
+  the right shape, but removing it would break callers that import
+  from `merge.publish`. The script-level entrypoint is the supported
+  surface from Stage 5d onward.
+
+### Verified (laptop)
+
+- `pytest merge/tests/test_publish.py -v` — 18 tests, all passing.
+  Coverage: gen config rewrite shape (the 4 tunables + 4 structural
+  fields), backup-then-overwrite flow, missing-original no-backup path,
+  validation (missing config / chat template / weights / tokenizer /
+  dir), sharded weight layout acceptance, `.bak` exclusion from upload
+  list, dry-run no-side-effects, `--confirm` upload + create_repo call
+  shape, sampling-param overrides flowing through, validation failure
+  → exit 2 short-circuit, `--repo-id` and `--model-dir` required.
+- `python scripts/publish.py --help` renders the full argparse surface
+  + dry-run / confirm example block.
+- Full suite: `pytest merge/tests/ -v` — passing on the torch-free
+  laptop (skips remain torch/CUDA/vllm-gated).
+
+### To do (manual, by Julien)
+
+1. `python scripts/publish.py --model-dir bakeoff_2026-05-26-1145/ties/merged --repo-id cs-552-2026-emainelpe/group_model`
+   — inspect the printed plan and the new gen config.
+2. If both look right: re-run with `--confirm`.
+3. CI run on `cs-552-2026-emainelpe/group_model` post-push to confirm
+   the leaderboard hits the same pass@8 numbers we saw locally.

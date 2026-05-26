@@ -55,7 +55,9 @@ entirely.
 - `merge/pipeline.py` — orchestrator (stub, Stage 4)
 - `merge/infer.py` — vLLM-based n=8 inference per benchmark (Stage 5c.1)
 - `merge/eval_all.py` — multi-benchmark scorer + failure classifier (Stage 5c.1)
-- `merge/publish.py` — HF push (stub, Stage 5d)
+- `merge/publish.py` — legacy adapter-push stub (superseded by
+  `scripts/publish.py` once Stage 5d landed; kept to avoid breaking
+  imports).
 - `merge/tests/` — CPU-runnable tests; torch-dependent tests use
   `pytest.importorskip("torch")`
 
@@ -113,6 +115,17 @@ entirely.
   causes "Free memory ... less than desired ..." on engine init. vLLM's
   own default (0.9) demanded ~35 GB free and was the 2026-05-26 eval
   failure mode.
+- **Stage 5d publishing** (`scripts/publish.py`) uploads a merged full
+  HF-format model dir to a target HF repo. **Dry-run by default**:
+  without `--confirm` it prints the upload plan + the
+  `generation_config.json` that would be written, and exits without
+  touching the model dir or the Hub. Rewrites
+  `generation_config.json` (backing up the original to `.bak`) only on
+  the `--confirm` path so CI grades under the validated bake-off
+  sampling params. `--repo-id` is required (no default → no accidental
+  push to the wrong slug). Usage:
+  `python scripts/publish.py --model-dir bakeoff_<date>/ties/merged --repo-id cs-552-2026-emainelpe/group_model`
+  then re-run with `--confirm` to push.
   The `PYTORCH_CUDA_ALLOC_CONF` env var reduces fragmentation across the
   multiple base-model alloc/free cycles in one bake-off — pair with the
   Day 8 follow-up that scopes the AdaMerging forward_fn to the
