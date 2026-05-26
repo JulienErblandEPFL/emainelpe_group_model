@@ -137,6 +137,7 @@ def adamerging(
     max_steps: int = 1000,
     early_stop_patience: int = 100,
     progress_log_every: int = 50,
+    aggregate_domains: bool = False,
 ) -> AdaMergingResult:
     """Train per-(task, layer) coefficients via entropy minimization.
 
@@ -177,6 +178,26 @@ def adamerging(
             consecutive steps (default 100). Improvement threshold is
             ``best_loss - 1e-6``.
         progress_log_every: Log step + loss every N steps (default 50).
+        aggregate_domains: When ``False`` (default), the loop is the
+            original per-batch SGD — one optimizer step per yielded
+            ``(domain_idx, batch)``. This is the path the 2026-05-26
+            bake-off used; default behavior is preserved byte-for-byte
+            for reproducibility. When ``True``, each optimizer step
+            consumes ``n_tasks`` consecutive yields from ``data_iter``
+            (assumed round-robin across the ``n_tasks`` domains, as
+            :func:`merge.data.unlabeled.make_unlabeled_iter` produces),
+            forwards each batch through ``forward_fn`` with the SAME
+            merged task vector, averages the per-domain entropies into
+            a single scalar, adds L2 once, then does one backward +
+            step. This matches the original AdaMerging formulation
+            (entropy aggregated across the unlabeled set per update)
+            and is the recommended mode for fresh experiments. Note
+            that ``max_steps`` then counts OPTIMIZER UPDATES, not
+            batches — the iterator must yield at least
+            ``max_steps * n_tasks`` tuples. ``loss_history`` records
+            the aggregated loss per update; lower default ``lr`` (e.g.
+            1e-3) is recommended since the per-update signal is much
+            less noisy than the per-batch one.
 
     Returns:
         :class:`AdaMergingResult` with the final merged task vector,
@@ -211,46 +232,127 @@ def adamerging(
     steps_run = 0
     early_stopped = False
 
-    for step, (domain_idx, batch) in enumerate(data_iter):
-        if step >= max_steps:
-            break
+    if aggregate_domains:
+        # Original-formulation path: one optimizer step absorbs one batch
+        # per domain. ``max_steps`` here counts optimizer UPDATES.
+        iterator = iter(data_iter)
+        for step in range(max_steps):
+            collected: list[tuple[int, dict]] = []
+            exhausted = False
+            for _ in range(n_tasks):
+                try:
+                    collected.append(next(iterator))
+                except StopIteration:
+                    exhausted = True
+                    break
+            if exhausted or len(collected) < n_tasks:
+                logger.info(
+                    "adamerging (aggregated) data_iter exhausted at update %d "
+                    "(got %d/%d batches); stopping.",
+                    step, len(collected), n_tasks,
+                )
+                break
 
-        merged = _compute_merged(task_vectors, coefficients, name_to_layer)
-        logits = forward_fn(merged, batch)  # [B, T, V]
-        last_logits = logits[:, -1, :]  # [B, V]
-        log_probs = torch.log_softmax(last_logits, dim=-1)
-        probs = torch.softmax(last_logits, dim=-1)
-        entropy = -(probs * log_probs).sum(dim=-1).mean()
-        l2 = lambda_l2 * coefficients.pow(2).sum()
-        loss = entropy + l2
+            seen_domains = {d for d, _ in collected}
+            if len(seen_domains) < n_tasks:
+                # Round-robin should give exactly one of each domain in any
+                # n_tasks consecutive yields. If the caller passed a
+                # non-round-robin iterator, the aggregation degrades to
+                # "n_tasks batches per step, some domains repeated". Log
+                # once at WARNING but proceed — it's still a strictly less
+                # noisy objective than per-batch SGD.
+                logger.warning(
+                    "adamerging (aggregated) expected %d distinct domains in "
+                    "%d consecutive yields; got %d (domains=%s). Iterator "
+                    "may not be round-robin.",
+                    n_tasks, n_tasks, len(seen_domains), sorted(seen_domains),
+                )
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            merged = _compute_merged(task_vectors, coefficients, name_to_layer)
+            per_domain_entropies = []
+            for domain_idx, batch in collected:
+                logits = forward_fn(merged, batch)
+                last_logits = logits[:, -1, :]
+                log_probs = torch.log_softmax(last_logits, dim=-1)
+                probs = torch.softmax(last_logits, dim=-1)
+                per_domain_entropies.append(
+                    -(probs * log_probs).sum(dim=-1).mean()
+                )
+            entropy = torch.stack(per_domain_entropies).mean()
+            l2 = lambda_l2 * coefficients.pow(2).sum()
+            loss = entropy + l2
 
-        loss_value = loss.item()
-        loss_history.append(loss_value)
-        steps_run = step + 1
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        if loss_value < best_loss - 1e-6:
-            best_loss = loss_value
-            steps_since_improvement = 0
-        else:
-            steps_since_improvement += 1
+            loss_value = loss.item()
+            loss_history.append(loss_value)
+            steps_run = step + 1
 
-        if step % progress_log_every == 0 or step == max_steps - 1:
-            logger.info(
-                "adamerging step=%d loss=%.4f entropy=%.4f l2=%.6f best=%.4f domain=%d",
-                step, loss_value, entropy.item(), l2.item(), best_loss, domain_idx,
-            )
+            if loss_value < best_loss - 1e-6:
+                best_loss = loss_value
+                steps_since_improvement = 0
+            else:
+                steps_since_improvement += 1
 
-        if steps_since_improvement >= early_stop_patience:
-            logger.info(
-                "adamerging early-stop at step %d (no improvement for %d steps)",
-                step, early_stop_patience,
-            )
-            early_stopped = True
-            break
+            if step % progress_log_every == 0 or step == max_steps - 1:
+                logger.info(
+                    "adamerging (aggregated) update=%d loss=%.4f entropy=%.4f "
+                    "l2=%.6f best=%.4f domains=%s",
+                    step, loss_value, entropy.item(), l2.item(), best_loss,
+                    sorted(seen_domains),
+                )
+
+            if steps_since_improvement >= early_stop_patience:
+                logger.info(
+                    "adamerging (aggregated) early-stop at update %d "
+                    "(no improvement for %d updates)",
+                    step, early_stop_patience,
+                )
+                early_stopped = True
+                break
+    else:
+        for step, (domain_idx, batch) in enumerate(data_iter):
+            if step >= max_steps:
+                break
+
+            merged = _compute_merged(task_vectors, coefficients, name_to_layer)
+            logits = forward_fn(merged, batch)  # [B, T, V]
+            last_logits = logits[:, -1, :]  # [B, V]
+            log_probs = torch.log_softmax(last_logits, dim=-1)
+            probs = torch.softmax(last_logits, dim=-1)
+            entropy = -(probs * log_probs).sum(dim=-1).mean()
+            l2 = lambda_l2 * coefficients.pow(2).sum()
+            loss = entropy + l2
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_value = loss.item()
+            loss_history.append(loss_value)
+            steps_run = step + 1
+
+            if loss_value < best_loss - 1e-6:
+                best_loss = loss_value
+                steps_since_improvement = 0
+            else:
+                steps_since_improvement += 1
+
+            if step % progress_log_every == 0 or step == max_steps - 1:
+                logger.info(
+                    "adamerging step=%d loss=%.4f entropy=%.4f l2=%.6f best=%.4f domain=%d",
+                    step, loss_value, entropy.item(), l2.item(), best_loss, domain_idx,
+                )
+
+            if steps_since_improvement >= early_stop_patience:
+                logger.info(
+                    "adamerging early-stop at step %d (no improvement for %d steps)",
+                    step, early_stop_patience,
+                )
+                early_stopped = True
+                break
 
     with torch.no_grad():
         final_coefficients = coefficients.detach().clone()

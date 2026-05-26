@@ -1876,3 +1876,292 @@ merge_and_unload).
   benefit — when the bakeoff invokes `merge_adapters` for
   `dare_adamerging`, the metrics file lands in the per-(method, temp)
   merged dir alongside the model. No bakeoff change needed.
+
+---
+
+## Day 8 follow-up #7 (2026-05-26) — AdaMerging diagnostic run: instability + likely implementation deviation
+
+### What ran
+
+`scripts/adamerging_diagnostic.py` (added in follow-up #6) re-ran
+`dare_adamerging` on the 4 real adapters with the bake-off
+hyperparameters (drop_rate=0.5, seed=42, max_steps=200, lr=1e-2,
+lambda_l2=1e-4, init_coefficient=0.3, batch_size=2). Artifacts
+under `/scratch/Group/emainelpe_group_model/adamerging_diagnostic/`:
+`metrics.json`, `loss_curve.png`, `coefficients_heatmap.png`.
+
+### Headline numbers (from `metrics.json`)
+
+- **Training stopped early at step 159** (early_stop_patience=100,
+  max_steps=200) — the loop ran ≥100 consecutive steps without
+  improving on `best_loss`.
+- **Loss did not converge.** Per-step total loss (entropy + L2)
+  swung between ~0.0031 and ~2.66 across the 159 steps — three
+  orders of magnitude — with no monotone trend. First loss ≈ 0.0036,
+  last loss ≈ 0.0050. There is no curve to read; it is noise around
+  a bimodal-by-domain regime.
+- **Learned coefficients scattered**, including into negative
+  territory despite init=0.3 (all positive):
+
+  | task              | min     | max    | mean   |
+  |-------------------|---------|--------|--------|
+  | math              | −0.415  | +0.540 | +0.116 |
+  | general_knowledge | −0.349  | +0.412 | +0.055 |
+  | safety            | −0.386  | +0.595 | +0.179 |
+  | multilingual      | −0.379  | +0.599 | +0.151 |
+
+  Coefficients drifted far from init and acquired sign changes per
+  layer.
+
+### Apparent paradox: scattered coefficients, near-identical weights
+
+Follow-up #5's weight-space comparison found `dare_adamerging`'s
+merged output was only ~0.74% (mean abs, relative) different from
+`dare_uniform`'s, and all 4 merge methods were within 1.7% pairwise.
+So despite per-(task, layer) coefficients ranging across roughly
+[−0.4, +0.6] with sign flips, the resulting merged weights barely
+move off the uniform baseline. Two compatible reads: (a) the
+per-task coefficients average out across the sum
+`sum_i c_{i,L} · tv_i[k]`; (b) the optimizer is wandering noisily
+in coefficient space without driving the merged weight tensor
+anywhere in particular.
+
+### Likely root cause: per-domain single-batch SGD ≠ paper objective
+
+Reading the training loop in `merge/methods/adamerging.py`:
+
+- `data_iter` yields `(domain_idx, batch)` round-robin across 4
+  domains.
+- Each step takes ONE batch (`batch_size=2`) from ONE domain and
+  computes entropy on the LAST token only.
+- The optimizer steps after every such batch (lr=1e-2).
+
+Different domains produce very different last-token entropies
+(math prompts at this scale are near-deterministic, entropy ≈
+0.003; general-knowledge / safety / multilingual prompts are open,
+entropy ≈ 2.6). So the per-step loss alternates between regimes
+that differ by ~3 orders of magnitude, and the gradients between
+adjacent steps point at fundamentally different objectives. With
+a 1e-2 lr on a 4×28 coefficient grid and no batching across
+domains, this is high-variance SGD on a non-stationary objective.
+
+The original AdaMerging formulation aggregates entropy across the
+unlabeled distribution per parameter update (i.e. one update step
+absorbs evidence from multiple domains, not one). Our current loop
+deviates from that: per-step gradients are dominated by whichever
+domain the iterator happened to land on.
+
+We attribute the loss instability and the wandering coefficients
+to this implementation deviation — not to a fundamental limitation
+of the AdaMerging method itself. This is a hypothesis consistent
+with the symptoms, not a proof.
+
+### What this entry deliberately does NOT claim
+
+- It does not claim AdaMerging the method fails on this problem.
+  All we have measured is that *our current implementation*, with
+  per-domain single-batch SGD at lr=1e-2, fails to converge on
+  this setup.
+- It does not claim the 0.74% weight-space delta vs. uniform is
+  evidence of "AdaMerging didn't learn anything." The coefficients
+  clearly moved (mean drifted from 0.3 to ~0.05-0.18, range opened
+  to ~1.0). What it suggests is that *the movements canceled out
+  in weight space*, which is consistent with a non-stationary
+  objective producing zero-mean coefficient noise.
+
+### Next step (in progress, outcome pending)
+
+A corrected implementation is being attempted (Option B): aggregate
+entropy across all 4 domains within a single forward/backward pass
+(or accumulate gradients over a domain-balanced minibatch) so each
+optimizer step minimizes the same multi-domain objective. The
+hypothesis: a stationary objective will let the loss actually
+descend and the coefficients converge to a meaningful per-layer
+allocation. If after that fix the merged model is still ~uniform
+in weight space, the implementation deviation is ruled out and we
+will revisit whether the AdaMerging signal is genuinely too weak
+on this 4-adapter Qwen3-1.7B setup. Outcome pending — to be
+recorded in a subsequent follow-up.
+
+### What does not change in the meantime
+
+The published group model remains `ties @ T=0.5`
+(`cs-552-2026-emainelpe/group_model`). The bake-off ranking
+discussion in follow-up #5 stands; this entry only sharpens *why*
+`dare_adamerging` lands near the uniform baseline on the published
+artifact.
+
+---
+
+## Day 8 follow-up #8 (2026-05-26) — AdaMerging Option B: opt-in domain-aggregated objective
+
+### Hypothesis under test (from follow-up #7)
+
+Our `adamerging()` loop deviated from the paper formulation by
+taking one optimizer step per single-domain batch. The round-robin
+data iterator yields domains 0,1,2,3,0,1,... so consecutive
+gradient steps optimize entropies that differ by ~3 orders of
+magnitude (math ≈ 0.003 vs others ≈ 2.6). Hypothesis: aggregating
+entropies across one batch from EACH domain before each optimizer
+step gives a stationary multi-domain objective and recovers
+convergence.
+
+### Design choice: `aggregate_domains: bool` (opt-in)
+
+Two API shapes were considered:
+
+- `steps_per_update: int = 1` — gradient-accumulation-style; expressive
+  but conflates "how many batches per update" with "domain coverage."
+- **`aggregate_domains: bool = False`** *(chosen)* — boolean flag with
+  a clear, single semantic: "one batch per domain per update." Easier
+  to reason about, harder to misuse, doesn't add a numeric knob to
+  the surface.
+
+Default is `False`, which preserves the existing path byte-for-byte
+— important because the 2026-05-26 bake-off used the default path
+and the published `ties` winner was selected against
+`dare_adamerging` results from that exact code path. The new path is
+strictly additive; one new test
+(`test_adamerging_default_unchanged_byte_for_byte`) pins this.
+
+### `max_steps` semantics under aggregation
+
+When `aggregate_domains=True`, `max_steps` counts **optimizer
+UPDATES**, not batches. Each update consumes `n_tasks` consecutive
+yields from `data_iter`. So:
+
+- `n_tasks=4, max_steps=200` ⇒ 200 updates ⇒ 800 batches consumed.
+- The caller must ensure `data_iter` yields at least
+  `max_steps * n_tasks` tuples. `scripts/adamerging_diagnostic.py`
+  provisions this automatically by passing
+  `make_unlabeled_iter(max_steps=args.max_steps * n_tasks)` when the
+  flag is set.
+- `loss_history` length equals the number of UPDATES executed (≤
+  `max_steps`). Early-stop patience counts updates too.
+
+This is documented in the docstring and in the `--aggregate-domains`
+help text.
+
+### One-batch-per-domain from the round-robin iterator (verified)
+
+`make_unlabeled_iter` yields::
+
+    for step in range(max_steps):
+        domain_idx = step % n_domains
+        yield (domain_idx, next(cyclers[domain_idx]))
+
+So in any `n_domains` consecutive yields, the `domain_idx` values
+are `0, 1, ..., n_domains-1` (in that order). With `n_domains ==
+n_tasks` (== 4 for our setup, by construction: each task is one
+domain), consuming `n_tasks` consecutive yields gives exactly one
+batch per domain. The aggregated branch in `adamerging` does that
+via a plain inner `for _ in range(n_tasks): next(iterator)` loop.
+
+For robustness, the branch additionally checks that the
+`n_tasks` consumed `domain_idx`s are distinct and logs a WARNING
+if a non-round-robin iterator was passed. This is a soft check —
+the aggregation still proceeds (it's still strictly less noisy than
+single-batch SGD) but the warning makes the deviation visible.
+
+`test_adamerging_aggregated_consumes_n_tasks_batches_per_update`
+wraps the synthetic iterator in a counter and asserts exactly
+`max_steps * n_tasks` `__next__` calls happen — the cheapest possible
+proof that the iterator-consumption discipline is correct.
+
+### Aggregation operation: mean over domains
+
+Two reasonable choices for combining the 4 per-domain entropies:
+
+- **mean** *(chosen)* — keeps the entropy magnitude on the same scale
+  as the single-batch path, so `lambda_l2=1e-4` continues to balance
+  entropy vs regularization the same way. A direct drop-in.
+- **sum** — multiplies entropy by `n_tasks`, requiring a 4× lower
+  `lambda_l2` to keep the same trade-off. Surprising to a future
+  reader.
+
+L2 is added once per update (it's a function of coefficients, not of
+the batches), matching the single-batch path.
+
+### Recommendation: lower `lr` for the aggregated mode
+
+Not enforced — `lr` stays a free parameter the caller chooses. The
+docstring notes that with a smoother per-update signal, lr=1e-3 is a
+more reasonable starting point than the lr=1e-2 the bake-off used.
+The diagnostic script defaults to `--lr 1e-2` to keep the
+flag-flip-only comparison clean; the report can rerun with
+`--lr 1e-3 --aggregate-domains` if the lr=1e-2 aggregated run still
+oscillates.
+
+### Diagnostic script changes
+
+- New flag `--aggregate-domains`. When set:
+  - `output_dir` is auto-suffixed with `_aggregated/` so the
+    baseline (round-robin) artifacts under
+    `/scratch/Group/emainelpe_group_model/adamerging_diagnostic/`
+    are preserved. The aggregated artifacts land at
+    `/scratch/Group/emainelpe_group_model/adamerging_diagnostic_aggregated/`.
+  - `data_iter` is sized to `max_steps * n_tasks` automatically.
+  - `aggregate_domains=True` is forwarded to `adamerging()`.
+  - `aggregate_domains` is recorded in the
+    `metrics.json` `hyperparams` snapshot so the run is
+    self-identifying.
+- **Matplotlib hardening**: `metrics.json` is written FIRST. The
+  loss-curve and heatmap plots are wrapped in `try/except` that logs
+  a warning and proceeds. Reason: the baseline 2026-05-26 run wrote
+  metrics fine but crashed at the plot step, which (combined with
+  the metrics-after-plots ordering at the time) was what almost lost
+  the curve data a second time. This ordering guarantees the JSON
+  always lands.
+
+### Tests
+
+4 new tests in `merge/tests/test_adamerging.py`:
+
+- `test_adamerging_default_unchanged_byte_for_byte`:
+  reproducibility pin. Same fixture, two calls (one implicit
+  default, one explicit `aggregate_domains=False`) must give
+  identical `loss_history` and bitwise-equal coefficients.
+- `test_adamerging_aggregated_consumes_n_tasks_batches_per_update`:
+  iterator-consumption discipline (counted by a wrapper iterator).
+- `test_adamerging_aggregated_stops_clean_on_short_iterator`:
+  partial-update exhaustion stops cleanly without raising; reports
+  fewer `steps_run`.
+- `test_adamerging_aggregated_loss_history_records_aggregated_value`:
+  smoke check that the recorded per-update loss is a finite
+  positive scalar.
+
+All 4 are torch-gated (skip on the torch-free laptop, run on the
+cluster). Full local suite: **160 passed, 115 skipped** — same 160
+pass count as before, 4 new skips for the new torch-gated tests.
+
+### Files modified
+
+- `merge/methods/adamerging.py` — `aggregate_domains` parameter +
+  aggregated branch. Default path UNCHANGED.
+- `scripts/adamerging_diagnostic.py` — flag, output-dir suffix,
+  iterator sizing, hyperparams snapshot, matplotlib try/except.
+- `merge/tests/test_adamerging.py` — 4 new tests.
+
+### Next step (cluster gate)
+
+Re-run the diagnostic in the new mode::
+
+    nohup python3 scripts/adamerging_diagnostic.py \
+        --aggregate-domains \
+        --adapters-dir loras/ \
+        --output-dir /scratch/Group/emainelpe_group_model/adamerging_diagnostic/ \
+        > adamerging_diagnostic_aggregated.log 2>&1 &
+
+(Note: pass the BASE output-dir; the script appends `_aggregated`
+automatically.) Approximate wall-clock: ~4× the baseline run, since
+each optimizer step now does 4 forwards through Qwen3-1.7B. With
+batch_size=2 on an A100-40g, the autograd graph for 4 forwards is
+within budget, but watch GPU memory; if it OOMs, drop `--batch-size`
+to 1 or `--max-steps` to 100.
+
+If the aggregated loss curve descends and the coefficients settle
+into a stable pattern, the implementation-deviation hypothesis from
+follow-up #7 is confirmed and we have a working AdaMerging signal
+to put in the final report. If the curve still oscillates, the
+hypothesis is rejected and AdaMerging's signal on this 4-adapter
+Qwen3-1.7B setup is genuinely weak.

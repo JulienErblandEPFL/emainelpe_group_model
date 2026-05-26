@@ -68,6 +68,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--early-stop-patience", type=int, default=100)
+    parser.add_argument(
+        "--aggregate-domains",
+        action="store_true",
+        help=(
+            "Use AdaMerging's aggregated-objective mode: each optimizer "
+            "update sees one batch per domain (n_tasks=4 batches), the "
+            "per-domain entropies are averaged, then one backward + step. "
+            "Matches the original paper formulation; recommended for fresh "
+            "runs. ``--max-steps`` then counts optimizer UPDATES, not "
+            "batches, so the data iterator must yield "
+            "``max_steps * n_tasks`` tuples (the script provisions this "
+            "automatically). Outputs go to a separate dir suffixed "
+            "``_aggregated`` so the round-robin baseline is preserved."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -129,6 +144,10 @@ def _write_coefficients_heatmap(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # Aggregated mode writes to a separate sibling dir so the round-robin
+    # baseline outputs are preserved for before/after comparison.
+    if args.aggregate_domains:
+        args.output_dir = args.output_dir.with_name(args.output_dir.name + "_aggregated")
     _refuse_tmp(args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -183,17 +202,24 @@ def main(argv: list[str] | None = None) -> int:
         tokenizer = AutoTokenizer.from_pretrained(args.base_model)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        n_tasks = len(task_vectors)
+        # Aggregated mode: each optimizer update consumes n_tasks batches,
+        # so the iterator must be sized accordingly. make_unlabeled_iter
+        # caps internally at its own max_steps, so we provision exactly
+        # what adamerging() will consume in the worst case.
+        iter_steps = args.max_steps * n_tasks if args.aggregate_domains else args.max_steps
         data_iter = make_unlabeled_iter(
             tokenizer=tokenizer,
             batch_size=args.batch_size,
-            max_steps=args.max_steps,
+            max_steps=iter_steps,
             seed=args.seed,
             device=args.device,
         )
 
+        mode = "aggregated" if args.aggregate_domains else "round-robin (baseline)"
         logger.info(
-            "Step 5/6: Run adamerging (max_steps=%d, lr=%g, lambda_l2=%g, init=%g) ...",
-            args.max_steps, args.lr, args.lambda_l2, args.init_coefficient,
+            "Step 5/6: Run adamerging mode=%s (max_steps=%d, lr=%g, lambda_l2=%g, init=%g) ...",
+            mode, args.max_steps, args.lr, args.lambda_l2, args.init_coefficient,
         )
         result = adamerging(
             dared,
@@ -204,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             lambda_l2=args.lambda_l2,
             max_steps=args.max_steps,
             early_stop_patience=args.early_stop_patience,
+            aggregate_domains=args.aggregate_domains,
         )
 
         logger.info("Step 6/6: Persist metrics + figures ...")
@@ -230,20 +257,37 @@ def main(argv: list[str] | None = None) -> int:
                 "batch_size": args.batch_size,
                 "early_stop_patience": args.early_stop_patience,
                 "base_model": args.base_model,
+                "aggregate_domains": args.aggregate_domains,
             },
         }
+        # Metrics first: figures are nice-to-have, but losing the JSON
+        # because matplotlib choked (the 2026-05-26 baseline run crashed
+        # at plot time, losing the curve) is the failure mode this
+        # ordering prevents.
         metrics_path = args.output_dir / "metrics.json"
         with metrics_path.open("w") as f:
             json.dump(metrics, f, indent=2)
         logger.info("  wrote %s", metrics_path)
 
         loss_path = args.output_dir / "loss_curve.png"
-        _write_loss_curve(result.loss_history, loss_path)
-        logger.info("  wrote %s", loss_path)
+        try:
+            _write_loss_curve(result.loss_history, loss_path)
+            logger.info("  wrote %s", loss_path)
+        except Exception as exc:  # noqa: BLE001 — figures are best-effort
+            logger.warning(
+                "loss curve plot failed (%s: %s); metrics.json still written.",
+                type(exc).__name__, exc,
+            )
 
         heatmap_path = args.output_dir / "coefficients_heatmap.png"
-        _write_coefficients_heatmap(result.coefficients, task_names, heatmap_path)
-        logger.info("  wrote %s", heatmap_path)
+        try:
+            _write_coefficients_heatmap(result.coefficients, task_names, heatmap_path)
+            logger.info("  wrote %s", heatmap_path)
+        except Exception as exc:  # noqa: BLE001 — figures are best-effort
+            logger.warning(
+                "coefficients heatmap failed (%s: %s); metrics.json still written.",
+                type(exc).__name__, exc,
+            )
 
         # Console summary.
         loss = result.loss_history
