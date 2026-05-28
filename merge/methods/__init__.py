@@ -171,6 +171,7 @@ def dare_adamerging(
     max_steps: int = 1000,
     early_stop_patience: int = 100,
     progress_log_every: int = 50,
+    aggregate_domains: bool = False,
     metrics_out_path: Path | str | None = None,
     task_names: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -193,7 +194,12 @@ def dare_adamerging(
         seed: Optional global seed; per-tv seed is ``seed + i``.
         rescale: Whether DARE rescales survivors.
         init_coefficient, lr, lambda_l2, max_steps, early_stop_patience,
-            progress_log_every: Forwarded to :func:`adamerging`.
+            progress_log_every, aggregate_domains: Forwarded to
+            :func:`adamerging`. ``aggregate_domains=True`` switches
+            AdaMerging to the original-paper objective (one batch per
+            domain per optimizer update); under that mode the supplied
+            ``data_iter`` MUST yield at least ``max_steps * n_tasks``
+            tuples.
 
     Returns:
         Merged task vector dict (unwrapped from
@@ -223,6 +229,7 @@ def dare_adamerging(
         max_steps=max_steps,
         early_stop_patience=early_stop_patience,
         progress_log_every=progress_log_every,
+        aggregate_domains=aggregate_domains,
     )
 
     final_loss = result.loss_history[-1] if result.loss_history else float("nan")
@@ -251,6 +258,7 @@ def dare_adamerging(
                 "lambda_l2": lambda_l2,
                 "max_steps": max_steps,
                 "early_stop_patience": early_stop_patience,
+                "aggregate_domains": aggregate_domains,
             },
         )
 

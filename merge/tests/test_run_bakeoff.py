@@ -257,6 +257,105 @@ def test_build_method_kwargs_dare_adamerging_without_state_raises() -> None:
         bakeoff_mod.build_method_kwargs("dare_adamerging", None, 200)
 
 
+def test_build_method_kwargs_aggregate_domains_off_by_default() -> None:
+    """Default (flag absent / False) must NOT inject aggregate_domains —
+    preserves the first bake-off's exact dare_adamerging behavior."""
+    state = {"forward_fn": object(), "data_iter": object()}
+    kw = bakeoff_mod.build_method_kwargs("dare_adamerging", state, 123)
+    assert "aggregate_domains" not in kw
+    kw_explicit = bakeoff_mod.build_method_kwargs(
+        "dare_adamerging", state, 123, aggregate_domains=False,
+    )
+    assert "aggregate_domains" not in kw_explicit
+
+
+def test_build_method_kwargs_aggregate_domains_on_when_flag_set() -> None:
+    """With the flag set, dare_adamerging kwargs carry aggregate_domains=True."""
+    state = {"forward_fn": object(), "data_iter": object()}
+    kw = bakeoff_mod.build_method_kwargs(
+        "dare_adamerging", state, 123, aggregate_domains=True,
+    )
+    assert kw["aggregate_domains"] is True
+
+
+def test_build_method_kwargs_aggregate_domains_ignored_for_non_adamerging() -> None:
+    """The flag only affects dare_adamerging; simple methods are untouched."""
+    kw_uniform = bakeoff_mod.build_method_kwargs(
+        "uniform", None, 200, aggregate_domains=True,
+    )
+    assert kw_uniform == {}
+    kw_dare = bakeoff_mod.build_method_kwargs(
+        "dare_uniform", None, 200, aggregate_domains=True,
+    )
+    assert "aggregate_domains" not in kw_dare
+
+
+def test_aggregate_domains_arg_parses() -> None:
+    """--aggregate-domains is a store_true flag, default False."""
+    parser = bakeoff_mod.build_parser()
+    base = [
+        "--adapters-dir", ".",
+        "--validation-samples-dir", ".",
+        "--output-dir", ".",
+    ]
+    assert parser.parse_args(base).aggregate_domains is False
+    assert parser.parse_args(base + ["--aggregate-domains"]).aggregate_domains is True
+
+
+def test_build_adamerging_state_sizes_iter_for_aggregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In aggregated mode the data_iter must be requested with
+    max_steps * n_tasks tuples (one batch per domain per optimizer
+    update). We stub the heavy deps and capture the max_steps passed to
+    make_unlabeled_iter."""
+    captured: dict[str, Any] = {}
+
+    # Stub the three modules _build_adamerging_state imports lazily.
+    fake_transformers = types.ModuleType("transformers")
+
+    class _FakeTok:
+        pad_token = "<pad>"
+        eos_token = "<eos>"
+
+        @classmethod
+        def from_pretrained(cls, *a, **k):
+            return cls()
+
+    fake_transformers.AutoTokenizer = _FakeTok
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    fake_unlabeled = types.ModuleType("merge.data.unlabeled")
+    fake_unlabeled.assert_cache_exists = lambda *a, **k: None
+
+    def _fake_make_iter(*a, **k):
+        captured["max_steps"] = k["max_steps"]
+        return iter([])
+
+    fake_unlabeled.make_unlabeled_iter = _fake_make_iter
+    monkeypatch.setitem(sys.modules, "merge.data.unlabeled", fake_unlabeled)
+
+    fake_qwen = types.ModuleType("merge.qwen3_forward")
+    fake_qwen.make_qwen3_forward = lambda *a, **k: (object(), lambda: None)
+    monkeypatch.setitem(sys.modules, "merge.qwen3_forward", fake_qwen)
+
+    n_tasks = len(bakeoff_mod.CANONICAL_DOMAINS)
+
+    # Aggregated: iter sized to max_steps * n_tasks.
+    ns_agg = types.SimpleNamespace(
+        base_model="x", adamerging_max_steps=50, aggregate_domains=True,
+    )
+    bakeoff_mod._build_adamerging_state(ns_agg)
+    assert captured["max_steps"] == 50 * n_tasks
+
+    # Default: iter sized to max_steps only.
+    ns_off = types.SimpleNamespace(
+        base_model="x", adamerging_max_steps=50, aggregate_domains=False,
+    )
+    bakeoff_mod._build_adamerging_state(ns_off)
+    assert captured["max_steps"] == 50
+
+
 def test_build_method_kwargs_unknown_method_raises() -> None:
     with pytest.raises(ValueError, match=r"unknown method"):
         bakeoff_mod.build_method_kwargs("nope", None, 200)

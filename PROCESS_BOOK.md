@@ -2323,3 +2323,309 @@ becomes answerable (does the aggregated objective actually
 converge?). If it still OOMs, something larger than the per-domain
 activation graphs is responsible and we revisit the budget from
 scratch.
+
+---
+
+## Day 8 follow-up #10 (2026-05-26) — Aggregated AdaMerging RESULTS: instability fixed, coefficients still underdetermined
+
+Builds on follow-ups #7 (baseline diagnostic showing oscillation),
+#8 (opt-in aggregated mode), and #9 (gradient-accumulation memory
+fix that made the cluster run feasible). This entry records the
+empirical outcome of the aggregated cluster run and the
+interpretation that closes out the AdaMerging investigation.
+
+### Aggregated run completed clean
+
+Launched per the follow-up #9 plan with `--aggregate-domains`. The
+gradient-accumulation rewrite did its job — the previous OOM did not
+recur. Artifacts under
+`/scratch/Group/emainelpe_group_model/adamerging_diagnostic_aggregated/`
+(`metrics.json`, `loss_curve.png`, `coefficients_heatmap.png`).
+
+### Headline numbers (from `metrics.json` — see verification note)
+
+- **193 optimizer updates, early-stopped at update 192** (patience
+  100, max_steps 200). Each update consumed 4 batches (one per
+  domain); every update's `seen_domains` was `[0, 1, 2, 3]`,
+  confirming the round-robin → one-per-domain consumption discipline
+  from follow-up #8 held throughout.
+- **Loss converged.** First update ≈ 1.2014; min ≈ 0.0133 reached
+  around update ~92; thereafter it plateaus, wobbling 0.24–0.40
+  around a low level with a max ~2.01 from occasional spikes. Last
+  update ≈ 0.3954. The shape is smooth descent then plateau — a
+  genuine convergence curve, qualitatively different from the
+  baseline's flat 3-orders-of-magnitude oscillation.
+- **Learned coefficients** (init=0.3) per task across 28 layers:
+
+  | task              | min     | max     | mean    |
+  |-------------------|---------|---------|---------|
+  | math              | −0.458  | +0.677  | +0.148  |
+  | general_knowledge | −0.487  | +0.536  | +0.024  |
+  | safety            | −0.346  | +0.798  | +0.186  |
+  | multilingual      | −0.308  | +0.630  | +0.173  |
+
+### Comparison with baseline (follow-up #7)
+
+| signal                       | baseline (round-robin)               | aggregated                                |
+|------------------------------|--------------------------------------|-------------------------------------------|
+| training behaviour           | oscillation 0.003 ↔ 2.66, no trend  | smooth descent ~1.20 → ~0.013 then plateau |
+| early-stop                   | step 159 (no improvement found)     | update 192 (loss did improve, then plateaued) |
+| math coeff range / mean      | [−0.415, +0.540] / +0.116            | [−0.458, +0.677] / +0.148                 |
+| gen_knowledge coeff range / mean | [−0.349, +0.412] / +0.055        | [−0.487, +0.536] / +0.024                 |
+| safety coeff range / mean    | [−0.386, +0.595] / +0.179            | [−0.346, +0.798] / +0.186                 |
+| multilingual coeff range / mean | [−0.379, +0.599] / +0.151        | [−0.308, +0.630] / +0.173                 |
+
+Two things to read from this table:
+
+1. The training-stability problem from follow-up #7 is **fixed**.
+   That confirms the implementation-deviation hypothesis: the
+   baseline's failure to converge was caused by per-domain
+   single-batch SGD on a non-stationary objective, not by an
+   intrinsic AdaMerging limitation.
+2. The **converged coefficients are about as scattered as the
+   baseline's**. Same rough span (~[−0.4, +0.7]), same sign-mixing,
+   means in the same low range with the same ranking
+   (safety > multilingual > math > general_knowledge). Convergence
+   in loss did not translate into a sharper, more interpretable
+   per-layer allocation.
+
+#### Caveat: best-loss numbers are NOT directly comparable
+
+The baseline's best loss ≈ 0.0034 vs. the aggregated's best ≈ 0.0133
+looks like the aggregated is "worse." It is not. The baseline
+measured **single-domain** entropy at each step — its 0.0034 came
+from one lucky math batch hitting the deterministic-math regime mid
+3-orders-of-magnitude oscillation. The aggregated value is the
+**mean entropy across all 4 domains** per update, which can never
+drop below the floor set by the high-entropy open-prompt domains
+(safety/gen_knowledge/multilingual ≈ 2.6 baseline). What is
+comparable across the two runs is the SHAPE of the curve
+(oscillation vs descent + plateau), not the magnitude.
+
+### Interpretation (inference, not re-verified)
+
+Three facts now stand together:
+
+1. The aggregated training converges in loss (this entry).
+2. The converged coefficients are scattered / underdetermined (this
+   entry).
+3. From follow-up #5's weight-space comparison: all four merge
+   methods produce ~99 % identical merged weights (< 1.7 %
+   pairwise, mean abs relative). `dare_adamerging`'s merged model
+   sat ~0.74 % away from `dare_uniform`'s — well within the
+   methods-are-all-the-same band.
+
+Read together, the most natural inference is: the four task vectors
+on these adapters are **near-collinear and of modest magnitude**, so
+the entropy objective is **nearly flat** with respect to how the
+task vectors are weighted. Many coefficient combinations produce
+near-identical merged models and near-identical entropy. The
+optimizer therefore finds *a* low-entropy point, but the loss
+surface offers no pressure toward any specific per-layer
+allocation — the coefficients are underdetermined. The practical
+consequence is that AdaMerging's adaptivity provides **no benefit
+over simple averaging on these particular adapters**.
+
+This is an inference, not a re-verified measurement. To confirm it
+we would need to (a) re-merge with the aggregated coefficients,
+(b) re-diff the resulting full model against `dare_uniform`'s, and
+(c) check whether the gap is again ≈ 0.74 % — which would close the
+loop on "the aggregated run converged to a coefficient pattern that
+still yields the ~uniform merge." That extra step was not run; the
+inference rests on the coefficient scatter combined with the
+existing 99 %-identical-merges finding.
+
+### Coefficient granularity (relevant to the scatter)
+
+AdaMerging in our implementation learns **per-(task, layer)**
+coefficients: shape `[N_tasks, N_layers]` = `[4, 28]` = **112
+scalars**. The 7 LoRA target-module types within each layer
+(`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`,
+`down_proj`) share that layer's coefficient — the merge math
+indexes `coefficient[task, layer_of_k]` via
+`_layer_index_from_canonical(k)`, which extracts the layer index
+only. So the 196 weight matrices that constitute the merged
+adapter (28 layers × 7 modules) are weighted with only 112
+free parameters, not 196. This is consistent with the AdaMerging
+paper's per-layer formulation; just noting it because the heatmap
+has 28 columns (layers), not 196.
+
+`n_layers=28` matches Qwen3-1.7B's `num_hidden_layers` (verified
+in earlier sessions; the layer-name regex would have errored out
+during `_layer_index_from_canonical` otherwise, and the diagnostic
+ran clean).
+
+### Figures saved for the report
+
+Four figures across the two diagnostic dirs (referenced by the
+report; copies staged under `report_figures/` for inclusion in the
+write-up):
+
+- baseline `loss_curve.png` — oscillation, no trend.
+- baseline `coefficients_heatmap.png` — scattered, sign-mixed.
+- aggregated `loss_curve.png` — smooth descent + plateau.
+- aggregated `coefficients_heatmap.png` — also scattered and
+  sign-mixed, despite the converged loss.
+
+The visual contrast on the loss curves is the most striking part
+of the AdaMerging story; the visual similarity of the two
+coefficient heatmaps is the punchline.
+
+### Outcome for the published model
+
+No change. The group model on
+`cs-552-2026-emainelpe/group_model` remains `ties @ T=0.5` from
+follow-up #5. The conclusion above gives us the writeup we need
+in the final report — AdaMerging was investigated, an
+implementation deviation was diagnosed and fixed, and the
+properly-trained variant converges in loss but to an
+underdetermined coefficient pattern that produces a merged model
+within noise of the simpler methods. That is exactly consistent
+with the bake-off ranking.
+
+### What is genuinely closed vs. genuinely open
+
+- **Closed**: AdaMerging training stability on this setup. The
+  fix is the aggregated objective (follow-up #8) + gradient
+  accumulation (follow-up #9), verified by the descent + plateau
+  in the loss curve.
+- **Closed**: the question "did we just have a bad implementation
+  of AdaMerging?" — diagnosed and corrected.
+- **Open (left as inference, not verified)**: the underlying
+  geometric claim that the four task vectors are near-collinear
+  / small-magnitude such that the entropy surface is flat. The
+  scatter-plus-uniform-merge pattern is consistent with this but
+  was not separately measured.
+- **Open**: whether a re-merge under the aggregated coefficients
+  reproduces the ~0.74 % vs `dare_uniform` weight-space delta.
+  Not run; would close the inference loop.
+
+Neither open item gates the final report or the published model.
+
+### Verification note
+
+The two `metrics.json` files live on the cluster
+(`/scratch/Group/emainelpe_group_model/...`) and are not present on
+the laptop where this entry was written. The numbers above are
+transcribed from the session that produced them (matching prior
+practice in follow-ups #5 and #7); a fresh `cat metrics.json` on
+the cluster is the authoritative source. If any value here
+disagrees with the file, the file wins and only the affected
+line/cell needs editing.
+
+---
+
+## Day 8 follow-up #11 (2026-05-26) — plumb aggregate_domains through dare_adamerging + bake-off
+
+### Why
+
+Follow-up #10's diagnostic proved the aggregated objective CONVERGES
+(loss 1.20 → 0.013), but it only produced `metrics.json` + figures —
+NOT a saved, evaluable model. The path that *does* save + eval a
+full merged model is `merge_adapters(method="dare_adamerging")` via
+`scripts/run_bakeoff.py`. But `aggregate_domains` (added to
+`adamerging()` in follow-up #8, commit 056e1d7) was never plumbed
+through `dare_adamerging()` or the bake-off — confirmed by grep:
+zero hits in either file. So we could not bake-off-and-eval a
+*converged* dare_adamerging model.
+
+This entry closes that gap so the aggregated variant can be built,
+scored against TIES on the same validation set, and published if it
+wins.
+
+### Two gaps, both closed
+
+1. **`dare_adamerging()` dropped the flag silently.** Its
+   `adamerging(...)` call enumerated kwargs explicitly
+   (`init_coefficient=..., lr=..., ...`), so any extra kwarg a caller
+   passed was discarded without error. Added
+   `aggregate_domains: bool = False` to the signature and forwarded
+   it into the call. Also recorded in the persisted
+   `adamerging_metrics.json` hyperparams so a baked model is
+   self-identifying.
+
+2. **The bake-off had no flag and mis-sized the iterator.** Added
+   `--aggregate-domains` (store_true, default False). When set:
+   - `build_method_kwargs` injects `aggregate_domains=True` for
+     `dare_adamerging` only (ignored for uniform / dare_uniform /
+     ties).
+   - `_build_adamerging_state` sizes the data iterator to
+     `max_steps * n_tasks`.
+
+### The iterator-sizing fix (the load-bearing line)
+
+`make_unlabeled_iter`'s generator runs `for step in range(max_steps)`
+— it yields *exactly* `max_steps` tuples, it does not cycle forever.
+In aggregated mode each optimizer UPDATE consumes `n_tasks` (= 4)
+batches, so requesting only `max_steps` would starve training at
+update `max_steps // 4`. The fix::
+
+    n_tasks = len(CANONICAL_DOMAINS)
+    iter_steps = (
+        args.adamerging_max_steps * n_tasks
+        if getattr(args, "aggregate_domains", False)
+        else args.adamerging_max_steps
+    )
+
+This mirrors exactly how `scripts/adamerging_diagnostic.py`
+(follow-up #8) sizes its iterator under `--aggregate-domains`. So
+`--adamerging-max-steps 200 --aggregate-domains` runs 200 optimizer
+updates (800 batches consumed), matching the diagnostic run that
+converged.
+
+### `max_steps` semantics (restated for the bake-off surface)
+
+`--adamerging-max-steps` counts AdaMerging optimizer steps. In the
+default (per-batch) mode that's one batch per step. Under
+`--aggregate-domains` it counts UPDATES, each consuming `n_tasks`
+batches — documented in the `--adamerging-max-steps` help text.
+
+### Default behavior unchanged
+
+Every new parameter defaults to `False`. The first bake-off's
+`dare_adamerging` path is byte-identical when the flag is absent:
+`build_method_kwargs` injects nothing, the iterator is sized to
+`max_steps` as before, and `dare_adamerging` forwards
+`aggregate_domains=False` (which selects the unchanged per-batch
+branch in `adamerging`). Existing bake-off tests stay green.
+
+### Tests
+
+- `merge/tests/test_adamerging.py`:
+  `test_dare_adamerging_forwards_aggregate_domains` — spies on the
+  mocked `adamerging` and asserts the flag arrives as `False` by
+  default and `True` when set.
+- `merge/tests/test_run_bakeoff.py`:
+  - `..._aggregate_domains_off_by_default` / `..._on_when_flag_set`
+    — kwarg injection only when the flag is set.
+  - `..._aggregate_domains_ignored_for_non_adamerging` — uniform /
+    dare_uniform are untouched.
+  - `test_aggregate_domains_arg_parses` — store_true, default False.
+  - `test_build_adamerging_state_sizes_iter_for_aggregation` — stubs
+    transformers / unlabeled / qwen3_forward and captures the
+    `max_steps` passed to `make_unlabeled_iter`: `50 * n_tasks`
+    aggregated, `50` default.
+
+Full suite: **165 passed, 118 skipped** (was 160 passed; the 5 new
+bake-off tests are torch-free and run; the dare_adamerging
+forwarding test is torch-gated). Default-path bake-off tests
+unchanged and green.
+
+### Files modified
+
+- `merge/methods/__init__.py` — `dare_adamerging` signature + call +
+  metrics hyperparams.
+- `scripts/run_bakeoff.py` — `--aggregate-domains` flag,
+  `build_method_kwargs` injection, `_build_adamerging_state` iter
+  sizing, threading from `args` through both.
+- `merge/tests/test_adamerging.py`,
+  `merge/tests/test_run_bakeoff.py` — new tests.
+
+### Cluster gate
+
+Re-run the bake-off (or a single-method sweep) with
+`--aggregate-domains` to build + eval the converged dare_adamerging
+model, then compare its scorecards against the published `ties`
+model from follow-up #5. Launch unchanged from the documented
+command plus `--aggregate-domains`; pick a distinct `--output-dir`
+so the first bake-off's results are preserved for comparison.

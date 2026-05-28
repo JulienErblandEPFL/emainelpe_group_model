@@ -510,6 +510,51 @@ def test_dare_adamerging_no_metrics_when_path_omitted(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_dare_adamerging_forwards_aggregate_domains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dare_adamerging must thread aggregate_domains into the adamerging()
+    call (the bug this fix closes: the call enumerated kwargs explicitly
+    and silently dropped the flag). Capture the kwargs the mock receives."""
+    pytest.importorskip("torch")
+    import torch
+
+    import merge.methods as methods_mod
+    from merge.methods import dare_adamerging
+
+    fake = _fake_adamerging_result()
+    captured: dict = {}
+
+    def _spy(*args, **kwargs):
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setattr(methods_mod, "adamerging", _spy)
+
+    tv = {k: torch.ones_like(v) for k, v in fake.merged.items()}
+    task_vectors = [tv, {**tv}, {**tv}, {**tv}]
+
+    # Default: aggregate_domains forwarded as False.
+    dare_adamerging(
+        task_vectors,
+        forward_fn=lambda m, b: None,
+        data_iter=iter([]),
+        drop_rate=0.5, seed=42, max_steps=4,
+    )
+    assert captured.get("aggregate_domains") is False
+
+    captured.clear()
+    # Explicit True is forwarded.
+    dare_adamerging(
+        task_vectors,
+        forward_fn=lambda m, b: None,
+        data_iter=iter([]),
+        drop_rate=0.5, seed=42, max_steps=4,
+        aggregate_domains=True,
+    )
+    assert captured.get("aggregate_domains") is True
+
+
 def test_dare_adamerging_metrics_requires_task_names(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

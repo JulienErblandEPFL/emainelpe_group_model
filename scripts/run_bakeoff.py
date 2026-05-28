@@ -245,7 +245,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             f"AdaMerging training steps for dare_adamerging "
             f"(default {ADAMERGING_BAKEOFF_CONFIG['max_steps']}; "
-            "production training uses ~1000)."
+            "production training uses ~1000). Under "
+            "--aggregate-domains, this counts optimizer UPDATES (each "
+            "consumes n_tasks batches); the data iterator is sized to "
+            "max_steps * n_tasks automatically."
+        ),
+    )
+    parser.add_argument(
+        "--aggregate-domains",
+        action="store_true",
+        help=(
+            "Run AdaMerging in the original-paper aggregated objective: "
+            "one batch per domain per optimizer update (n_tasks=4 "
+            "batches/update), mean-of-entropies + L2, one accumulated "
+            "backward. Diagnostic run on 2026-05-26 showed this "
+            "converges where the per-domain SGD path oscillates. "
+            "Default off preserves the first bake-off's exact behavior."
         ),
     )
     return parser
@@ -454,6 +469,7 @@ def build_method_kwargs(
     method: str,
     adamerging_state: dict[str, Any] | None,
     adamerging_max_steps: int,
+    aggregate_domains: bool = False,
 ) -> dict[str, Any]:
     """Build the ``method_kwargs`` dict for one method.
 
@@ -462,6 +478,12 @@ def build_method_kwargs(
         adamerging_state: Dict with ``forward_fn`` and ``data_iter`` keys,
             or ``None`` if dare_adamerging is not in the sweep.
         adamerging_max_steps: Overrides the bake-off default for max_steps.
+        aggregate_domains: When ``True`` and ``method == "dare_adamerging"``,
+            adds ``aggregate_domains=True`` to the merge kwargs so AdaMerging
+            uses the original-paper aggregated objective. The caller is
+            responsible for ensuring ``adamerging_state["data_iter"]`` was
+            sized to ``max_steps * n_tasks`` tuples (see
+            :func:`_build_adamerging_state`).
 
     Returns:
         Kwargs dict appropriate for the method.
@@ -486,6 +508,8 @@ def build_method_kwargs(
         kwargs["max_steps"] = adamerging_max_steps
         kwargs["forward_fn"] = adamerging_state["forward_fn"]
         kwargs["data_iter"] = adamerging_state["data_iter"]
+        if aggregate_domains:
+            kwargs["aggregate_domains"] = True
         return kwargs
     raise ValueError(f"unknown method: {method!r}")
 
@@ -577,6 +601,7 @@ def run_bakeoff(
         try:
             method_kwargs = build_method_kwargs(
                 method, adamerging_state, args.adamerging_max_steps,
+                aggregate_domains=getattr(args, "aggregate_domains", False),
             ) if adamerging_build_error is None else None
         except ValueError as exc:
             adamerging_build_error = str(exc)
@@ -777,10 +802,20 @@ def _build_adamerging_state(args: argparse.Namespace) -> tuple[dict[str, Any], C
         base_model_repo=args.base_model,
         device="cuda",
     )
+    # Under aggregate_domains, adamerging() counts max_steps as optimizer
+    # UPDATES and consumes n_tasks (= n_domains) batches per update. The
+    # iterator must therefore yield max_steps * n_tasks tuples or it runs
+    # dry mid-training. Mirrors scripts/adamerging_diagnostic.py's sizing.
+    n_tasks = len(CANONICAL_DOMAINS)
+    iter_steps = (
+        args.adamerging_max_steps * n_tasks
+        if getattr(args, "aggregate_domains", False)
+        else args.adamerging_max_steps
+    )
     data_iter = make_unlabeled_iter(
         tokenizer=tokenizer,
         batch_size=ADAMERGING_BAKEOFF_CONFIG["batch_size"],
-        max_steps=args.adamerging_max_steps,
+        max_steps=iter_steps,
         seed=ADAMERGING_BAKEOFF_CONFIG["seed"],
         device="cuda",
     )
