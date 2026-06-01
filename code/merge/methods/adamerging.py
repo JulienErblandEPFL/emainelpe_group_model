@@ -31,6 +31,11 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Minimum loss improvement (entropy + L2) for a step to count as progress;
+# below this, the early-stop patience counter advances. Used in both the
+# aggregated and per-batch training loops.
+_EARLY_STOP_MIN_DELTA = 1e-6
+
 
 @dataclass
 class AdaMergingResult:
@@ -312,7 +317,7 @@ def adamerging(
             loss_history.append(loss_value)
             steps_run = step + 1
 
-            if loss_value < best_loss - 1e-6:
+            if loss_value < best_loss - _EARLY_STOP_MIN_DELTA:
                 best_loss = loss_value
                 steps_since_improvement = 0
             else:
@@ -357,7 +362,7 @@ def adamerging(
             loss_history.append(loss_value)
             steps_run = step + 1
 
-            if loss_value < best_loss - 1e-6:
+            if loss_value < best_loss - _EARLY_STOP_MIN_DELTA:
                 best_loss = loss_value
                 steps_since_improvement = 0
             else:

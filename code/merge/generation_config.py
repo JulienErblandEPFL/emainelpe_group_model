@@ -11,8 +11,12 @@ This module provides:
   tunable values; contractual fields are filled in automatically.
 - :func:`load_generation_config` — hierarchical fallback loader used at
   eval time (adapter dir → repo root → Qwen3 defaults).
-- :data:`QWEN3_DEFAULTS` — the conservative tunable defaults used as the
-  lowest-priority fallback.
+- :data:`DEFAULT_SAMPLING` — the single source of truth for the tunable
+  sampling defaults, referenced by ``make_generation_config``,
+  ``InferenceConfig``, and the scripts' argparse defaults.
+- :data:`QWEN3_DEFAULTS` — backwards-compatible alias of
+  :data:`DEFAULT_SAMPLING` (the conservative tunable defaults used as the
+  lowest-priority fallback).
 """
 from __future__ import annotations
 
@@ -32,21 +36,31 @@ _QWEN3_PAD = 151643
 _TRANSFORMERS_VERSION = "4.51.0"
 
 
-# Tunable defaults (Qwen3-1.7B's published recommendations). Used as the
-# lowest-priority fallback when no gen config is found anywhere.
-QWEN3_DEFAULTS: dict[str, Any] = {
+# Single source of truth for the tunable sampling defaults (Qwen3-1.7B's
+# published recommendations). Referenced by ``make_generation_config`` below,
+# by :class:`merge.infer.InferenceConfig`, and by the scripts' argparse
+# defaults so the values live in exactly one place.
+#
+# ``max_new_tokens`` is 16384 on purpose: that is the project's CI ceiling and
+# the no-file fallback used by :func:`load_generation_config`. The eval scripts
+# deliberately override ``--max-tokens`` down to 2048 to speed up internal runs.
+DEFAULT_SAMPLING: dict[str, Any] = {
     "temperature": 0.7,
     "top_p": 0.8,
     "top_k": 20,
     "max_new_tokens": 16384,
 }
 
+# Backwards-compatible public alias: the Qwen3 published recommendations ARE
+# our default sampling params, so this is the same table.
+QWEN3_DEFAULTS: dict[str, Any] = DEFAULT_SAMPLING
+
 
 def make_generation_config(
-    temperature: float = 0.7,
-    top_p: float = 0.8,
-    top_k: int = 20,
-    max_new_tokens: int = 16384,
+    temperature: float = DEFAULT_SAMPLING["temperature"],
+    top_p: float = DEFAULT_SAMPLING["top_p"],
+    top_k: int = DEFAULT_SAMPLING["top_k"],
+    max_new_tokens: int = DEFAULT_SAMPLING["max_new_tokens"],
 ) -> dict[str, Any]:
     """Construct a complete ``generation_config.json`` dict matching the
     CS-552 project description schema.
@@ -144,4 +158,9 @@ def load_generation_config(
     return make_generation_config()
 
 
-__all__ = ["QWEN3_DEFAULTS", "make_generation_config", "load_generation_config"]
+__all__ = [
+    "DEFAULT_SAMPLING",
+    "QWEN3_DEFAULTS",
+    "make_generation_config",
+    "load_generation_config",
+]

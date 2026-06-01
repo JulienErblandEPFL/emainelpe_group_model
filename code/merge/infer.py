@@ -26,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from merge.generation_config import DEFAULT_SAMPLING
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,9 +44,9 @@ class InferenceConfig:
     cap; the locked spec's 16384 ceiling is reserved for CI.
     """
     n: int = 8
-    temperature: float = 0.7
-    top_p: float = 0.8
-    top_k: int = 20
+    temperature: float = DEFAULT_SAMPLING["temperature"]
+    top_p: float = DEFAULT_SAMPLING["top_p"]
+    top_k: int = DEFAULT_SAMPLING["top_k"]
     max_tokens: int = 2048
     seed: int = 42
 

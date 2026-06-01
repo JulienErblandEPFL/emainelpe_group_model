@@ -75,6 +75,9 @@ _TOKENIZER_FILES: tuple[str, ...] = (
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Torch-free import (generation_config is stdlib-only); keeps --help working.
+    from merge.generation_config import DEFAULT_SAMPLING
+
     parser = argparse.ArgumentParser(
         description=(
             "Publish a merged HF-format model directory to HF Hub. "
@@ -115,13 +118,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--top-p",
         type=float,
-        default=0.8,
+        default=DEFAULT_SAMPLING["top_p"],
         help="Nucleus sampling (default 0.8).",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=20,
+        default=DEFAULT_SAMPLING["top_k"],
         help="Top-k sampling (default 20).",
     )
     parser.add_argument(

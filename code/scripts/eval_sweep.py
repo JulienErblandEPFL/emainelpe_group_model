@@ -91,6 +91,9 @@ class SweepResultRow:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    # Torch-free import (generation_config is stdlib-only); keeps --help working.
+    from merge.generation_config import DEFAULT_SAMPLING
+
     parser = argparse.ArgumentParser(
         description="Evaluate one merged adapter at multiple temperatures.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -131,8 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=_REPO_ROOT / "chat_template.jinja",
         help="Path to chat_template.jinja (default: <repo>/chat_template.jinja).",
     )
-    parser.add_argument("--top-p", type=float, default=0.8, help="Nucleus sampling (default 0.8).")
-    parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling (default 20).")
+    parser.add_argument("--top-p", type=float, default=DEFAULT_SAMPLING["top_p"], help="Nucleus sampling (default 0.8).")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_SAMPLING["top_k"], help="Top-k sampling (default 20).")
     parser.add_argument("--n", type=int, default=8, help="Completions per problem (default 8).")
     parser.add_argument(
         "--max-tokens",

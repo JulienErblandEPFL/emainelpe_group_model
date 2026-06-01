@@ -293,7 +293,7 @@ def main(argv: list[str] | None = None) -> int:
         loss = result.loss_history
         if loss:
             pct = 100.0 * (loss[0] - loss[-1]) / max(abs(loss[0]), 1e-9)
-            print(f"\n=== AdaMerging diagnostic summary ===")
+            print("\n=== AdaMerging diagnostic summary ===")
             print(f"steps_run:     {result.steps_run}")
             print(f"early_stopped: {result.early_stopped}")
             print(f"initial loss:  {loss[0]:.4f}")

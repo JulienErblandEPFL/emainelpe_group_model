@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from merge.infer import InferenceConfig, load_validation_jsonl, run_inference
+from merge.load_adapter import CANONICAL_DOMAINS
 
 logger = logging.getLogger(__name__)
 
@@ -471,7 +472,7 @@ def evaluate_all_benchmarks(
 
     results: dict[str, BenchmarkResult] = {}
     try:
-        for benchmark in ("math", "general_knowledge", "safety", "multilingual"):
+        for benchmark in CANONICAL_DOMAINS:
             jsonl = validation_samples_dir / f"{benchmark}.jsonl"
             if not jsonl.exists():
                 raise FileNotFoundError(

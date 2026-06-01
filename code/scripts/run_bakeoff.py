@@ -164,6 +164,9 @@ class BakeoffPayload:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
+    # Torch-free import (generation_config is stdlib-only); keeps --help working.
+    from merge.generation_config import DEFAULT_SAMPLING
+
     parser = argparse.ArgumentParser(
         description="Run the full Stage 5c.2 bake-off (methods × temperatures).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -222,8 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=list(DEFAULT_TEMPERATURES),
         help=f"Sampling temperatures (default: {DEFAULT_TEMPERATURES}).",
     )
-    parser.add_argument("--top-p", type=float, default=0.8, help="Nucleus sampling.")
-    parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling.")
+    parser.add_argument("--top-p", type=float, default=DEFAULT_SAMPLING["top_p"], help="Nucleus sampling.")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_SAMPLING["top_k"], help="Top-k sampling.")
     parser.add_argument("--n", type=int, default=8, help="Completions per problem.")
     parser.add_argument("--max-tokens", type=int, default=2048, help="Max tokens per completion.")
     parser.add_argument("--seed", type=int, default=42, help="vLLM sampling seed.")
