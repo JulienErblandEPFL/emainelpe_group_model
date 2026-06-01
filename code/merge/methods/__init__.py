@@ -2,23 +2,22 @@
 Method registry for adapter merging.
 
 Maps method-name strings (used by ``merge.pipeline.merge_adapters``'s
-``method`` parameter) to callables. Six user-facing methods:
+``method`` parameter) to callables. Five user-facing methods:
 
 - ``"uniform"``           -> uniform_merge
 - ``"dare_uniform"``      -> DARE(each) then uniform_merge
-- ``"dare_weighted"``     -> DARE(each) then weighted_linear_merge
 - ``"ties"``              -> ties_merge                  (Stage 4)
 - ``"adamerging"``        -> adamerging                  (Stage 5a)
 - ``"dare_adamerging"``   -> DARE(each) then adamerging  (Stage 5a)
 
-The three ``dare_*`` entries are composition wrappers defined in this
+The two ``dare_*`` entries are composition wrappers defined in this
 module; the others re-export the per-module implementations.
 
 Note: ``adamerging`` and ``dare_adamerging`` have a richer call signature
-than the other methods. ``uniform``, ``dare_uniform``, ``dare_weighted``,
-and ``ties`` take ``(task_vectors, **method_kwargs)``. AdaMerging variants
-additionally require ``forward_fn`` and ``data_iter``, which must be
-supplied via ``method_kwargs`` when calling
+than the other methods. ``uniform``, ``dare_uniform``, and ``ties`` take
+``(task_vectors, **method_kwargs)``. AdaMerging variants additionally
+require ``forward_fn`` and ``data_iter``, which must be supplied via
+``method_kwargs`` when calling
 ``pipeline.merge_adapters(method="dare_adamerging", method_kwargs={...})``.
 
 Stage 5a implementation.
@@ -36,7 +35,6 @@ from .adamerging import AdaMergingResult, adamerging
 from .dare import dare
 from .ties import ties_merge
 from .uniform import uniform_merge
-from .weighted_linear import weighted_linear_merge
 
 
 logger = logging.getLogger(__name__)
@@ -121,42 +119,6 @@ def dare_uniform(
     return uniform_merge(masked)
 
 
-def dare_weighted(
-    task_vectors: list[dict[str, torch.Tensor]],
-    weights: list[float],
-    drop_rate: float = 0.5,
-    seed: int | None = None,
-    rescale: bool = True,
-) -> dict[str, torch.Tensor]:
-    """Compose DARE + weighted-linear merge.
-
-    Apply DARE to each input task vector independently, then take the
-    weighted linear combination. Per-task seed derivation matches
-    :func:`dare_uniform`.
-
-    Args:
-        task_vectors: List of N task-vector dicts.
-        weights: List of N floats, one per task vector.
-        drop_rate: DARE drop rate.
-        seed: Optional global seed.
-        rescale: Whether DARE rescales survivors.
-
-    Returns:
-        Merged task vector dict.
-    """
-    # See ``dare_uniform`` for the in-place rationale.
-    masked = [
-        dare(
-            tv, drop_rate,
-            seed=(None if seed is None else seed + i),
-            rescale=rescale,
-            inplace=True,
-        )
-        for i, tv in enumerate(task_vectors)
-    ]
-    return weighted_linear_merge(masked, weights)
-
-
 def dare_adamerging(
     task_vectors: list[dict[str, torch.Tensor]],
     forward_fn,
@@ -183,8 +145,7 @@ def dare_adamerging(
     fixed coefficients, which complicates convergence; doing it once
     gives a deterministic loss surface for entropy minimization.
 
-    Per-task seed = ``seed + i`` matches the pattern in :func:`dare_uniform`
-    and :func:`dare_weighted`.
+    Per-task seed = ``seed + i`` matches the pattern in :func:`dare_uniform`.
 
     Args:
         task_vectors: List of N task-vector dicts.
@@ -307,7 +268,6 @@ def _adamerging_dict(
 METHOD_REGISTRY: dict[str, Callable[..., dict[str, torch.Tensor]]] = {
     "uniform": uniform_merge,
     "dare_uniform": dare_uniform,
-    "dare_weighted": dare_weighted,
     "ties": ties_merge,
     "adamerging": _adamerging_dict,
     "dare_adamerging": dare_adamerging,

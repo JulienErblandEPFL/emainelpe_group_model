@@ -28,3 +28,21 @@ outputs/
 
 # Personal launcher (per-teammate GASPAR/GROUP values)
 docker/submit.sh
+
+# Bake-off / diagnostic outputs (large .safetensors model dirs, never versioned).
+# loras/, merged/, outputs/ are already ignored above — not duplicated here.
+bakeoff_*/
+adamerging_diagnostic*/
+sweep_*/
+
+# Logs
+*.log
+nohup.out
+
+# Caches
+hf_cache/
+.remember/
+
+# Stray large artifacts (merged-model shards, diagnostic figures)
+*.safetensors
+*.png

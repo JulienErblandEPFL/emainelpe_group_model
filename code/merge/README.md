@@ -64,8 +64,10 @@ verify_spec  →  load_adapter  →  methods.<method>  →  pipeline.bake  →  
    on-disk artifact is a self-contained HF-format directory (`config.json`
    + `model.safetensors`), not a LoRA adapter. (See Day 7 in PROCESS_BOOK
    for the rationale — vLLM's LoRA loader rejected our PEFT-format keys.)
-5. **publish** — upload to `cs-552-2026-emainelpe/group_model` via
-   `huggingface_hub.HfApi.upload_folder`.
+5. **publish** — upload the merged model dir to
+   `cs-552-2026-emainelpe/group_model` via `huggingface_hub.HfApi.upload_folder`.
+   Implemented as the runnable CLI `../scripts/publish.py` (dry-run by
+   default; `--confirm` to push).
 6. **eval_all** — generate completions against `../validation_samples/*.jsonl`
    via vLLM loaded directly on the merged model dir (no LoRA adapter
    plumbing), and score with `../evaluate/`. Compute the 4-domain
@@ -94,13 +96,12 @@ directly via `AutoModelForCausalLM.from_pretrained` or
 ## Method registry
 
 `merge/methods/__init__.py` exposes a single `METHOD_REGISTRY: dict[str, callable]`.
-The six user-facing methods, with implementation stage:
+The five user-facing methods, with implementation stage:
 
 | Method name | Implementation | Stage |
 |---|---|---|
 | `uniform` | `methods.uniform.uniform_merge` | Stage 3 |
 | `dare_uniform` | `methods.__init__.dare_uniform` (composes `dare` + `uniform_merge`) | Stage 3 |
-| `dare_weighted` | `methods.__init__.dare_weighted` (composes `dare` + `weighted_linear_merge`) | Stage 3 |
 | `ties` | `methods.ties.ties_merge` | Stage 4 |
 | `adamerging` | `methods.adamerging.adamerging` | Stage 5a |
 | `dare_adamerging` | `methods.__init__.dare_adamerging` (composes `dare` + `adamerging`) | Stage 5a |
@@ -144,8 +145,7 @@ Update this table as stages land. Single source of truth.
 | `load_adapter.py` | `canonicalize`, `decanonicalize`, `load`, `load_all` | 2 + 4 | **done** |
 | `methods/dare.py` | `dare` | 3 | **done** |
 | `methods/uniform.py` | `uniform_merge` | 3 | **done** |
-| `methods/weighted_linear.py` | `weighted_linear_merge` | 3 | **done** |
-| `methods/__init__.py` | `dare_uniform`, `dare_weighted` (compositions) | 3 | **done** |
+| `methods/__init__.py` | `dare_uniform` (composition) | 3 | **done** |
 | `methods/ties.py` | `ties_merge` | 4 | **done** |
 | `pipeline.py` | `merge_adapters`, `svd_factor` | 4 | **done** |
 | `tests/test_pipeline_synthetic.py` | end-to-end CPU test | 4 | **done** |
@@ -168,7 +168,7 @@ Update this table as stages land. Single source of truth.
 | `tests/test_eval_sweep.py` | argparse + sweep-resilience unit tests | 5c.1.5 | **done** |
 | `../scripts/run_bakeoff.py` | 4 methods × 3 temperatures orchestrator | 5c.2 | **done** |
 | `tests/test_run_bakeoff.py` | argparse + resilience + winner-pick unit tests | 5c.2 | **done** |
-| `publish.py` | `publish_adapter` | 5d | skeleton |
+| `../scripts/publish.py` | `publish` CLI (dry-run + `--confirm`) | 5d | **done** |
 
 ## Stage 5b: Real-Qwen3 plumbing for AdaMerging
 
@@ -373,5 +373,6 @@ identifying the highest average pass@8 across the 4 benchmarks.
 
 - Training the four specialist adapters (each teammate owns their own repo).
 - Editing the locked-spec contract files at the repo root.
-- Modifying `../evaluate/`, `../validation_samples/`, `../docker/`, or any
+- Modifying `../evaluate/`, `../validation_samples/`, `../../docker/`
+  (the `docker/` dir stayed at the repo root above `code/`), or any
   Classroom skeleton file.

@@ -5,7 +5,7 @@ DARE drops a fraction ``p`` of entries from each task vector uniformly at random
 then rescales the survivors by ``1/(1-p)`` so the expected magnitude is preserved.
 The dropped entries are set to zero; the result is a task vector ready to be
 combined with other DARE'd task vectors via any linear merging method
-(``uniform_merge`` or ``weighted_linear_merge``).
+(e.g. ``uniform_merge``).
 
 Reference: Yu et al. 2024 (DARE), https://arxiv.org/abs/2311.03099
 
@@ -53,7 +53,7 @@ def dare(
             outputs ≈ 24 GB peak, plus mask/intermediate fragmentation,
             exceeded the budget). Merge-method callers that consume
             their task_vectors only once (``dare_uniform``,
-            ``dare_weighted``, ``dare_adamerging``) opt into True; any
+            ``dare_adamerging``) opt into True; any
             caller that still needs the originals afterward must leave
             ``inplace=False``.
 

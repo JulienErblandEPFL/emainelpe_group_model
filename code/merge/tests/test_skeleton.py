@@ -4,10 +4,8 @@ Skeleton smoke tests for the ``merge/`` subpackage.
 What this file guarantees:
 1. Every module imports cleanly (or skips with a clear reason if torch is
    missing on the laptop).
-2. Each module's primary function raises ``NotImplementedError`` with the
-   correct stage tag — i.e. nobody snuck real logic into Stage 1.
-3. ``METHOD_REGISTRY`` exposes all six user-facing method names.
-4. ``lora.yaml`` still carries the team-locked values, including the new
+2. ``METHOD_REGISTRY`` exposes all five user-facing method names.
+3. ``lora.yaml`` still carries the team-locked values, including the new
    explicit ``modules_to_save: null`` line.
 
 Tests that touch ``torch`` use ``pytest.importorskip("torch")`` so they skip
@@ -32,23 +30,16 @@ def test_merge_package_imports() -> None:
     assert merge.__version__, "merge.__version__ should be a non-empty string"
 
 
-def test_publish_stub_raises_stage_5() -> None:
-    from merge import publish
-
-    with pytest.raises(NotImplementedError, match="Stage 5"):
-        publish.publish_adapter(Path("dummy"), "cs-552-2026-emainelpe/group_model")
-
-
 # ---------------------------------------------------------------------------
 # Torch-dependent modules (skip if torch is missing)
 # ---------------------------------------------------------------------------
 
-def test_method_registry_has_all_six_methods() -> None:
+def test_method_registry_has_all_five_methods() -> None:
     pytest.importorskip("torch")
     from merge.methods import METHOD_REGISTRY
 
     expected = {
-        "uniform", "dare_uniform", "dare_weighted",
+        "uniform", "dare_uniform",
         "ties", "adamerging", "dare_adamerging",
     }
     assert set(METHOD_REGISTRY.keys()) == expected, (

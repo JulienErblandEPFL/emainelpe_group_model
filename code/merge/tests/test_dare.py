@@ -215,7 +215,7 @@ def test_dare_inplace_mutates_input_and_returns_same_dict() -> None:
     even after the fp32→bf16 fix, allocating a fresh output dict on top
     of the 4 ~3 GB input task vectors exceeded the budget. ``inplace=True``
     eliminates the duplication; the merge composers
-    (``dare_uniform``/``dare_weighted``/``dare_adamerging``) opt into it
+    (``dare_uniform``/``dare_adamerging``) opt into it
     since the pipeline never re-reads originals after the merge_fn returns.
     """
     torch = pytest.importorskip("torch")

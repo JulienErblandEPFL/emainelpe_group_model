@@ -345,9 +345,9 @@ def test_method_registry_includes_dare_adamerging() -> None:
 
     assert "adamerging" in METHOD_REGISTRY
     assert "dare_adamerging" in METHOD_REGISTRY
-    assert len(METHOD_REGISTRY) == 6
+    assert len(METHOD_REGISTRY) == 5
     expected = {
-        "uniform", "dare_uniform", "dare_weighted",
+        "uniform", "dare_uniform",
         "ties", "adamerging", "dare_adamerging",
     }
     assert set(METHOD_REGISTRY.keys()) == expected

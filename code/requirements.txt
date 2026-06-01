@@ -39,3 +39,14 @@ vllm>=0.6.0
 # Or rely on this requirements.txt entry:
 #     pip install -r requirements.txt
 bitsandbytes>=0.44.0
+
+# M3 submission additions.
+# `peft` powers the LoRA factor injection + `merge_and_unload` bake in
+# `merge/pipeline.py`. `huggingface_hub` is the explicit dependency behind
+# `scripts/publish.py` (HfApi.upload_folder) and `scripts/fetch_adapters.py`
+# (snapshot_download) — pulled in transitively by transformers, but listed
+# here so the merge subdir is self-describing. `matplotlib` renders the loss
+# curve + coefficient heatmap in `scripts/adamerging_diagnostic.py`.
+peft>=0.10
+huggingface_hub>=0.23
+matplotlib>=3.7

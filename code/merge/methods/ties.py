@@ -12,8 +12,8 @@ For each parameter:
 3. **Disjoint merge**: per entry position, average only the task vectors
    whose sign matches the elected sign. Wrong-sign entries are excluded.
 
-This handles sign conflicts between adapters that uniform/weighted_linear
-silently average away.
+This handles sign conflicts between adapters that uniform merging
+silently averages away.
 
 Reference: Yadav et al. 2023 (TIES-Merging), https://arxiv.org/abs/2306.01708
 

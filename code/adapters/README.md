@@ -170,9 +170,10 @@ single OOM doesn't kill the run).
 - [`../merge/verify_spec.py`](../merge/verify_spec.py) — the verifier
   used by both the snippet in §3 and the pipeline's hard-fail
   startup check.
-- [`../PROCESS_BOOK.md`](../PROCESS_BOOK.md) — design log. Day 0
-  through Day 8 cover the why behind every locked choice on this page
-  (decision B2 on repo structure, modules_to_save rationale, etc.).
+- [`PROCESS_BOOK.md`](../../PROCESS_BOOK.md) — design log (at the repo
+  root, one level above `code/`). Day 0 through Day 8 cover the why behind
+  every locked choice on this page (decision B2 on repo structure,
+  modules_to_save rationale, etc.).
 - [`../merge/README.md`](../merge/README.md) — pipeline internals if
   you want to dig deeper.
 - Team channel (Émainèlpé, g65) for anything not covered here.
