@@ -174,7 +174,31 @@ python scripts/adamerging_diagnostic.py --aggregate-domains \
 Each run writes `metrics.json` (loss history + per-layer coefficients +
 hyperparameters), `loss_curve.png`, and `coefficients_heatmap.png`.
 
-## i) Tests
+## i) Reproduce the weight-similarity numbers
+
+The report cites pairwise weight-space differences between the merged models
+from the bake-off. To reproduce these from the merged checkpoints in the
+bake-off output directories:
+
+```bash
+python3 scripts/weight_similarity.py \
+    --models \
+      uniform:bakeoff_20260526_1145/uniform/merged \
+      ties:bakeoff_20260526_1145/ties/merged \
+      dare_uniform:bakeoff_dare_20260526_1246/dare_uniform/merged \
+      dare_adamerging_rr:bakeoff_dare_20260526_1246/dare_adamerging/merged \
+      dare_adamerging_agg:bakeoff_adamerging_agg_20260528_0943/dare_adamerging/merged \
+    --output weight_similarity.json
+```
+
+The script reads `model.safetensors` from each path, computes mean-absolute
+relative difference (MAR) on three representative MLP tensors (early, middle,
+late layers — `model.layers.{0,13,27}.mlp.down_proj.weight`), and prints a
+triangular matrix per tensor plus a JSON summary. Add `--metric both` for
+cosine similarity alongside MAR. Reads only the requested tensors from disk
+(via `safetensors.safe_open`); no GPU; runs in under a minute.
+
+## j) Tests
 
 ```bash
 pytest merge/tests/ -v
@@ -185,7 +209,7 @@ laptop; they run fully on a GPU node. The locked-spec regression test and the
 pure-IO / dataclass tests always run. A clean laptop run shows a large number
 of passes plus skips, no failures.
 
-## j) Utility commands
+## k) Utility commands
 
 Run a single method + evaluation:
 
@@ -208,7 +232,7 @@ python scripts/eval_sweep.py \
 Available methods: `uniform`, `dare_uniform`, `ties`, `adamerging`,
 `dare_adamerging`.
 
-## k) Environment
+## l) Environment
 
 - **GPU:** 1× A100 40 GB (minimum). The merged Qwen3-1.7B is ~3.4 GB in bf16.
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is recommended to reduce
@@ -229,7 +253,7 @@ Available methods: `uniform`, `dare_uniform`, `ties`, `adamerging`,
   are baked in (the one exception is `adamerging_diagnostic.py`'s default
   `--output-dir`, a cluster scratch path you can override).
 
-## l) Key hyperparameters
+## m) Key hyperparameters
 
 All fixed; override via the flags shown above.
 
