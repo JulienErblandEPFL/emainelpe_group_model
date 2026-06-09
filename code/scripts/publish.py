@@ -130,8 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=2048,
-        help="Max new tokens cap to bundle (default 2048).",
+        default=16384,
+        help="Max new tokens cap to bundle in generation_config.json (default 16384, matching CI ceiling).",
     )
     parser.add_argument(
         "--commit-message",

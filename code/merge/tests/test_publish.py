@@ -267,7 +267,7 @@ def test_publish_confirm_calls_upload_and_rewrites(
     assert written["temperature"] == 0.5
     assert written["top_p"] == 0.8
     assert written["top_k"] == 20
-    assert written["max_new_tokens"] == 2048
+    assert written["max_new_tokens"] == 16384
     # Backup of the original.
     assert (model_dir / "generation_config.json.bak").exists()
 
